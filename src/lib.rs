@@ -1,3 +1,5 @@
+mod json_rpc;
+
 use {
     core::{
         cell::{RefCell, Cell},
@@ -5,13 +7,12 @@ use {
     },
     enum_map::{enum_map, Enum},
     fehler::{throw, throws},
-    jsonrpc_core::{Id, Value, Version},
+    json_rpc::{Success, Kind, Object, Outcome, Id, Params, Method},
     log::{error, trace},
-    lsp_types::{PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem, RegistrationParams, notification::{PublishDiagnostics, Notification, Initialized, DidCloseTextDocument, DidOpenTextDocument, Exit}, request::{Initialize, Request, RegisterCapability, Shutdown}, InitializeParams, ClientCapabilities, InitializeResult, TextDocumentClientCapabilities, SynchronizationCapability, Url, InitializedParams, DidOpenTextDocumentParams, DidCloseTextDocumentParams},
+    lsp_types::{PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem, RegistrationParams, notification::{PublishDiagnostics, Notification}, request::{Request, RegisterCapability}, InitializeParams, ClientCapabilities, InitializeResult, TextDocumentClientCapabilities, SynchronizationCapability, Url, DidOpenTextDocumentParams, DidCloseTextDocumentParams},
     market::{io::Reader, ConsumeFailure, ClosedMarketError, Consumer, ComposeFrom, NonComposible, StripFrom, PermanentQueue, Producer, ProduceFailure, process::{CreateProcessError, WaitProcessError, Waiter, Process}, sync::{Releaser, Actuator}},
     parse_display::Display as ParseDisplay,
-    serde::{Deserialize, Serialize},
-    serde_json::error::Error as SerdeJsonError,
+    serde_json::{Number, Value, error::Error as SerdeJsonError},
     std::{fmt::{self, Display}, sync::Arc, rc::Rc, thread::{self, JoinHandle}, process::{self, Command}},
     thiserror::Error as ThisError,
 };
@@ -161,8 +162,8 @@ impl ClientStatement {
 impl From<ClientStatement> for ClientMessage {
     fn from(value: ClientStatement) -> Self {
         match value {
-            ClientStatement::OpenDoc { doc } => Self::Request(ClientRequest::OpenDoc(DidOpenTextDocumentParams{text_document: doc})),
-            ClientStatement::CloseDoc { doc } => Self::Request(ClientRequest::CloseDoc(DidCloseTextDocumentParams{text_document: doc})),
+            ClientStatement::OpenDoc { doc } => Self::Notification(ClientNotification::OpenDoc(DidOpenTextDocumentParams{text_document: doc})),
+            ClientStatement::CloseDoc { doc } => Self::Notification(ClientNotification::CloseDoc(DidCloseTextDocumentParams{text_document: doc})),
         }
     }
 }
@@ -216,7 +217,7 @@ pub enum TranslationError {
 }
 
 // TODO: Use different structs to track the state of the translator.
-pub struct Translator {
+pub(crate) struct Translator {
     client: Client,
     root_dir: Url,
     messages: Vec<ClientMessage>,
@@ -244,7 +245,7 @@ impl Translator {
         for message in self.messages.drain(..) {
             if self.is_initialized {
                 // Only exit may be sent prior to receiving initialize response.
-                if self.initialize_result.is_some() || message == ClientMessage::Request(ClientRequest::Exit) {
+                if self.initialize_result.is_some() || message == ClientMessage::Notification(ClientNotification::Exit) {
                     self.client.produce(message)?;
                 } else {
                     delayed_messages.push(message);
@@ -335,11 +336,11 @@ impl Translator {
             ServerMessage::Response(response) => match response {
                 ServerResponse::Initialize(initialize) => {
                     self.initialize_result = Some(initialize);
-                    Some(ClientMessage::Request(ClientRequest::Initialized))
+                    Some(ClientMessage::Notification(ClientNotification::Initialized))
                 }
                 ServerResponse::Shutdown => {
                     self.is_shutdown = true;
-                    Some(ClientMessage::Request(ClientRequest::Exit))
+                    Some(ClientMessage::Notification(ClientNotification::Exit))
                 }
             }
             ServerMessage::Notification(notification) => match notification {
@@ -376,7 +377,7 @@ impl Translator {
     }
 }
 
-pub struct Client {
+pub(crate) struct Client {
     server: Process<Message, Message, ErrorMessage>,
     next_id: Cell<u64>,
 }
@@ -399,10 +400,10 @@ impl Client {
         self.server.stderr()
     }
 
-    fn next_id(&self) -> u64 {
+    fn next_id(&self) -> Id {
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
-        id
+        Id::Num(Number::from(id))
     }
 }
 
@@ -412,7 +413,7 @@ impl Consumer for Client {
 
     #[throws(ConsumeFailure<Self::Error>)]
     fn consume(&self) -> Self::Good {
-        let good = self.server.consume().map_err(ConsumeFailure::map_into)?.try_into().map_err(|error: UnknownServerMessageFailure| ConsumeFailure::Error(error.into()))?;
+        let good = self.server.consume().map_err(ConsumeFailure::map_into)?.try_into().map_err(|error| ConsumeFailure::Error(Self::Error::from(error)))?;
         trace!("LSP Rx: {}", good);
         good
     }
@@ -425,20 +426,11 @@ impl Producer for Client {
     #[throws(ProduceFailure<Self::Error>)]
     fn produce(&self, good: Self::Good) {
         trace!("LSP Tx: {}", good);
-        let message = match good {
-            ClientMessage::Response { id, .. } => Message::response::<RegisterCapability>((), id).map_err(Self::Error::from)?,
-            ClientMessage::Request(request) => {
-
-                match request {
-                    ClientRequest::Initialize(params) => Message::request::<Initialize>(params, self.next_id()).map_err(Self::Error::from)?,
-                    ClientRequest::Initialized => Message::notification::<Initialized>(InitializedParams {}).map_err(Self::Error::from)?,
-                    ClientRequest::Shutdown => Message::request::<Shutdown>((), self.next_id()).map_err(Self::Error::from)?,
-                    ClientRequest::Exit => Message::notification::<Exit>(()).map_err(Self::Error::from)?,
-                    ClientRequest::OpenDoc(params) => Message::notification::<DidOpenTextDocument>(params).map_err(Self::Error::from)?,
-                    ClientRequest::CloseDoc(params) => Message::notification::<DidCloseTextDocument>(params).map_err(Self::Error::from)?,
-                }
-            }
-        };
+        let message = Message::from(match good {
+            ClientMessage::Response { id, response } => Object::response(id, response),
+            ClientMessage::Request(request) =>  Object::request(self.next_id(), request),
+            ClientMessage::Notification(notification) => Object::notification(notification),
+        });
 
         self.server.produce(message).map_err(ProduceFailure::map_into)?
     }
@@ -446,7 +438,7 @@ impl Producer for Client {
 
 /// A message from the language server.
 #[derive(Debug, ParseDisplay)]
-pub enum ServerMessage {
+pub(crate) enum ServerMessage {
     #[display("Response: {0}")]
     Response(ServerResponse),
     #[display("Request[{id:?}]: {request}")]
@@ -463,20 +455,20 @@ impl TryFrom<Message> for ServerMessage {
 
     #[throws(Self::Error)]
     fn try_from(other: Message) -> Self {
-        match other.object {
-            Object::Request {
+        match other.content.into() {
+            Kind::Request {
                 id: Some(request_id),
                 method,
                 params,
             } => Self::Request { id : request_id , request: ServerRequest::new(method, params)?},
-            Object::Request {
+            Kind::Request {
                 id: None,
                 method,
                 params,
             } => {
                 Self::Notification(ServerNotification::new(method, params)?)
             }
-            Object::Response {
+            Kind::Response {
                 outcome: Outcome::Result(value),
                 ..
             } => {
@@ -494,9 +486,9 @@ pub enum ServerNotification {
 
 impl ServerNotification {
     #[throws(UnknownServerMessageFailure)]
-    fn new(method: String, params: Value) -> Self {
+    fn new(method: String, params: Params) -> Self {
         match method.as_str() {
-            <PublishDiagnostics as Notification>::METHOD => Self::PublishDiagnostics(serde_json::from_value::<PublishDiagnosticsParams>(params.clone()).map_err(|error| UnknownServerMessageFailure::InvalidValue{method, value: params, error})?),
+            <PublishDiagnostics as Notification>::METHOD => Self::PublishDiagnostics(serde_json::from_value::<PublishDiagnosticsParams>(params.clone().into()).map_err(|error| UnknownServerMessageFailure::InvalidParams{method, params, error})?),
             _ => throw!(UnknownServerMessageFailure::UnknownMethod(method)),
         }
     }
@@ -510,9 +502,9 @@ pub enum ServerRequest {
 
 impl ServerRequest {
     #[throws(UnknownServerMessageFailure)]
-    fn new(method: String, params: Value) -> Self {
+    fn new(method: String, params: Params) -> Self {
         match method.as_str() {
-            <RegisterCapability as Request>::METHOD => ServerRequest::RegisterCapability(serde_json::from_value::<RegistrationParams>(params.clone()).map_err(|error| UnknownServerMessageFailure::InvalidValue{method, value: params, error})?),
+            <RegisterCapability as Request>::METHOD => ServerRequest::RegisterCapability(serde_json::from_value::<RegistrationParams>(params.clone().into()).map_err(|error| UnknownServerMessageFailure::InvalidParams{method, params, error})?),
             _ => throw!(UnknownServerMessageFailure::UnknownMethod(method)),
         }
     }
@@ -548,6 +540,7 @@ pub enum ClientMessage {
         id: Id,
         response: ClientResponse,
     },
+    Notification(ClientNotification),
 }
 
 impl Display for ClientMessage {
@@ -555,6 +548,7 @@ impl Display for ClientMessage {
         write!(f, "{}", match self {
             Self::Request(request) => format!("{}: {}", "Request", request),
             Self::Response{response, ..} => format!("{}: {}", "Response", response),
+            Self::Notification(notification) => format!("{}: {}", "Notification", notification),
         })
     }
 }
@@ -563,8 +557,28 @@ impl Display for ClientMessage {
 pub enum ClientRequest {
     #[display("Initialize w/ {0:?}")]
     Initialize(InitializeParams),
-    Initialized,
     Shutdown,
+}
+
+impl Method for ClientRequest {
+    fn method(&self) -> String {
+        match self {
+            Self::Initialize(_) => "initialize",
+            Self::Shutdown => "shutdown",
+        }.to_string()
+    }
+
+    fn params(&self) -> Params {
+        match self {
+            Self::Initialize(params) => Params::from(serde_json::to_value(params).unwrap()),
+            Self::Shutdown => Params::None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, ParseDisplay, PartialEq)]
+pub enum ClientNotification {
+    Initialized,
     Exit,
     #[display("OpenDoc w/ {0:?}")]
     OpenDoc(DidOpenTextDocumentParams),
@@ -572,71 +586,95 @@ pub enum ClientRequest {
     CloseDoc(DidCloseTextDocumentParams),
 }
 
+impl Method for ClientNotification {
+    fn method(&self) -> String {
+        match self {
+            Self::Initialized => "initialized",
+            Self::Exit => "exit",
+            Self::OpenDoc(_) => "textDocument/didOpen",
+            Self::CloseDoc(_) => "textDocument/didClose",
+        }.to_string()
+    }
+
+    fn params(&self) -> Params {
+        match self {
+            Self::Initialized => Params::None,
+            Self::Exit => Params::None,
+            Self::OpenDoc(params) => Params::from(serde_json::to_value(params).unwrap()),
+            Self::CloseDoc(params) => Params::from(serde_json::to_value(params).unwrap()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, ParseDisplay, PartialEq)]
 pub enum ClientResponse {
     RegisterCapability,
 }
 
-/// The content of an LSP message.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Message {
-    /// The JSON version.
-    jsonrpc: Version,
-    /// The items included in the content.
-    #[serde(flatten)]
-    object: Object,
-}
-
-impl Message {
-    /// Creates a new [`Message`].
-    fn new(object: Object) -> Self {
-        Self {
-            jsonrpc: Version::V2,
-            object,
+impl Success for ClientResponse {
+    fn result(&self) -> Value {
+        match self {
+            Self::RegisterCapability => Value::Null,
         }
     }
-
-    pub fn object(&self) -> &Object {
-        &self.object
-    }
-
-    /// Creates an LSP Request Message.
-    #[throws(SerdeJsonError)]
-    pub fn request<T>(params: T::Params, id: u64) -> Self
-    where
-        T: Request,
-        <T as Request>::Params: Serialize,
-    {
-        Object::request::<T>(params, Id::Num(id)).map(Self::new)?
-    }
-
-    /// Creates an LSP Notification Message.
-    #[throws(SerdeJsonError)]
-    pub fn notification<T>(params: T::Params) -> Self
-    where
-        T: Notification,
-        <T as Notification>::Params: Serialize,
-    {
-        Object::notification::<T>(params).map(Self::new)?
-    }
-
-    /// Creates an LSP Response Message.
-    #[throws(SerdeJsonError)]
-    pub fn response<T>(result: T::Result, id: Id) -> Self
-    where
-        T: Request,
-        <T as Request>::Result: Serialize,
-    {
-        Object::response::<T>(result, id).map(Self::new)?
-    }
 }
+
+#[derive(Debug, ParseDisplay)]
+#[display("{content}")]
+pub(crate) struct Message {
+    /// The JSON-RPC object of the message.
+    content: Object,
+}
+
+//impl Message {
+//    /// Creates a new [`Message`].
+//    fn new(object: Object) -> Self {
+//        Self {
+//            object,
+//        }
+//    }
+//
+//    pub fn object(&self) -> &Object {
+//        &self.object
+//    }
+//
+//    /// Creates an LSP Request Message.
+//    #[throws(SerdeJsonError)]
+//    pub fn request<T>(params: T::Params, id: Id) -> Self
+//    where
+//        T: Request,
+//        <T as Request>::Params: Serialize,
+//    {
+//        Object::request::<T>(id, params).map(Self::new)?
+//    }
+//
+//    /// Creates an LSP Notification Message.
+//    #[throws(SerdeJsonError)]
+//    pub fn notification<T>(params: T::Params) -> Self
+//    where
+//        T: Notification,
+//        <T as Notification>::Params: Serialize,
+//    {
+//        Object::notification::<T>(params).map(Self::new)?
+//    }
+//
+//    /// Creates an LSP Response Message.
+//    #[throws(SerdeJsonError)]
+//    pub fn response<T>(result: T::Result, id: Id) -> Self
+//    where
+//        T: Request,
+//        <T as Request>::Result: Serialize,
+//    {
+//        Object::response::<T>(result, id).map(Self::new)?
+//    }
+//}
 
 impl ComposeFrom<u8> for Message {
     #[throws(NonComposible)]
     fn compose_from(parts: &mut Vec<u8>) -> Self {
         let mut length = 0;
 
-        let message = std::str::from_utf8(parts).ok().and_then(|buffer| {
+        let object: Option<Object> = std::str::from_utf8(parts).ok().and_then(|buffer| {
             buffer.find(HEADER_END).and_then(|header_length| {
                 let mut content_length: Option<usize> = None;
 
@@ -684,19 +722,21 @@ impl ComposeFrom<u8> for Message {
         });
 
         let _ = parts.drain(..length);
-        message.ok_or(NonComposible)?
+        object.ok_or(NonComposible)?.into()
     }
 }
 
-impl Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.object)
+impl From<Object> for Message {
+    fn from(value: Object) -> Self {
+        Self {
+            content: value,
+        }
     }
 }
 
 impl StripFrom<Message> for u8 {
     fn strip_from(good: &Message) -> Vec<Self> {
-        serde_json::to_string(good).map_or(Vec::new(), |content| {
+        serde_json::to_string(&good.content).map_or(Vec::new(), |content| {
             format!(
                 "{}: {}{}{}",
                 HEADER_CONTENT_LENGTH,
@@ -707,107 +747,6 @@ impl StripFrom<Message> for u8 {
             .as_bytes()
             .to_vec()
         })
-    }
-}
-
-/// A json-rpc object.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum Object {
-    /// A request json-rpc object.
-    Request {
-        /// The method identifier.
-        method: String,
-        /// The parameters.
-        params: Value,
-        /// The id.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<Id>,
-    },
-    /// A response json-rpc object.
-    Response {
-        /// The outcome.
-        #[serde(flatten)]
-        outcome: Outcome,
-        /// The id.
-        id: Id,
-    },
-}
-
-impl Object {
-    fn type_name(&self) -> &str {
-        match self {
-            Self::Request { id: Some(_), .. } => "Request",
-            Self::Request { .. } => "Notification",
-            Self::Response { .. } => "Response",
-        }
-    }
-
-    fn value(&self) -> String {
-        match self {
-            Self::Request { method, params, .. } => format!("{} w/ {}", method, params),
-            Self::Response { outcome, .. } => outcome.to_string(),
-        }
-    }
-
-    #[throws(SerdeJsonError)]
-    fn request<T>(params: T::Params, id: Id) -> Self
-    where
-        T: Request,
-        <T as Request>::Params: Serialize,
-    {
-        Self::Request {
-            method: T::METHOD.to_string(),
-            params: serde_json::to_value(params)?,
-            id: Some(id),
-        }
-    }
-
-    #[throws(SerdeJsonError)]
-    fn notification<T>(params: T::Params) -> Self
-    where
-        T: Notification,
-        <T as Notification>::Params: Serialize,
-    {
-        Self::Request {
-            method: T::METHOD.to_string(),
-            params: serde_json::to_value(params)?,
-            id: None,
-        }
-    }
-
-    #[throws(SerdeJsonError)]
-    fn response<T>(result: T::Result, id: Id) -> Self
-    where
-        T: Request,
-        <T as Request>::Result: Serialize,
-    {
-        Self::Response {
-            outcome: Outcome::Result(serde_json::to_value(result)?),
-            id,
-        }
-    }
-}
-
-impl Display for Object {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} : {}", self.type_name(), self.value())
-    }
-}
-
-/// The outcome of a response.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Outcome {
-    /// The result was successful.
-    Result(Value),
-}
-
-impl Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Result(value) => write!(f, "Success {}", value),
-        }
     }
 }
 
@@ -825,10 +764,10 @@ pub enum UnknownServerMessageFailure {
     Response(#[from] UnknownServerResponseFailure),
     #[error("Unknown method: {0}")]
     UnknownMethod(String),
-    #[error("Unable to convert `{method}` from `{value}: {error}`")]
-    InvalidValue{
+    #[error("Unable to convert `{method}` from `{params}: {error}`")]
+    InvalidParams{
         method: String,
-        value: Value,
+        params: Params,
         #[source]
         error: SerdeJsonError,
     },
