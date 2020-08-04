@@ -9,7 +9,7 @@ use {
     fehler::{throw, throws},
     json_rpc::{Success, Kind, Object, Outcome, Id, Params, Method},
     log::{error, trace},
-    lsp_types::{PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem, RegistrationParams, notification::{PublishDiagnostics, Notification}, request::{Request, RegisterCapability}, InitializeParams, ClientCapabilities, InitializeResult, TextDocumentClientCapabilities, SynchronizationCapability, Url, DidOpenTextDocumentParams, DidCloseTextDocumentParams},
+    lsp_types::{Registration, PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem, RegistrationParams, notification::{PublishDiagnostics, Notification}, request::{Request, RegisterCapability}, InitializeParams, ClientCapabilities, InitializeResult, TextDocumentClientCapabilities, SynchronizationCapability, Url, DidOpenTextDocumentParams, DidCloseTextDocumentParams},
     market::{io::Reader, ConsumeFailure, ClosedMarketError, Consumer, ComposeFrom, NonComposible, StripFrom, PermanentQueue, Producer, ProduceFailure, process::{CreateProcessError, WaitProcessError, Waiter, Process}, sync::{Releaser, Actuator}},
     parse_display::Display as ParseDisplay,
     serde_json::{Number, Value, error::Error as SerdeJsonError},
@@ -63,22 +63,22 @@ impl Tongue {
     fn thread(root_dir: &Url, releaser: Releaser, outputs: Arc<PermanentQueue<ClientStatement>>, inputs: Arc<PermanentQueue<ServerStatement>>) {
         let rust_translator = Rc::new(RefCell::new(Translator::new(Client::new(
                 Command::new("rust-analyzer"),
-                )?, root_dir)));
+                )?, root_dir.clone())));
         // TODO: Currently plaintext_translator is a hack to deal with all files that do not have a known language. Ideally, this would run its own language server.
         let plaintext_translator = Rc::new(RefCell::new(Translator::new(Client::new(
                 Command::new("echo"),
-                )?, root_dir)));
-        plaintext_translator.borrow_mut().is_shutdown = true;
+                )?, root_dir.clone())));
+        plaintext_translator.borrow_mut().state = State::WaitingExit;
         let translators = enum_map! {
             Language::Rust => Rc::clone(&rust_translator),
             Language::Plaintext => Rc::clone(&plaintext_translator),
         };
 
-        while !translators.values().map(|t| t.borrow().is_shutdown).all(|x| x) {
+        while !translators.values().map(|t| t.borrow().state == State::WaitingExit).all(|x| x) {
             let will_shutdown = releaser.consume().is_ok();
 
             for output in outputs.consume_all().unwrap() {
-                translators[output.language()].borrow_mut().push_message(output.into());
+                translators[output.language()].borrow_mut().send_message(output.into())?;
             }
 
             for (_, translator) in &translators {
@@ -89,7 +89,7 @@ impl Tongue {
                 translator.borrow().log_errors();
 
                 if will_shutdown {
-                    translator.borrow().shutdown()?;
+                    translator.borrow_mut().shutdown()?;
                 }
             }
         }
@@ -214,99 +214,87 @@ pub enum TranslationError {
     Wait(#[from] WaitProcessError),
     #[error(transparent)]
     CollectOutputs(#[from] ConsumeFailure<<PermanentQueue<ClientMessage> as Consumer>::Error>),
+    #[error("Invalid state: Cannot {0} while {1}")]
+    InvalidState(Event, State),
 }
 
-// TODO: Use different structs to track the state of the translator.
+#[derive(Debug, ParseDisplay, PartialEq)]
+pub enum Event {
+    #[display("send message")]
+    SendMessage(ClientMessage),
+    #[display("process initialization")]
+    Initialized(InitializeResult),
+    #[display("register capability")]
+    RegisterCapability(Id, RegistrationParams),
+    #[display("complete shutdown")]
+    CompletedShutdown,
+    #[display("exit")]
+    Exit,
+}
+
+#[derive(Clone, Debug, ParseDisplay, PartialEq)]
+pub enum State {
+    #[display("uninitialized")]
+    Uninitialized{
+        root_dir: Url,
+    },
+    #[display("waiting initialization")]
+    WaitingInitialization{
+        messages: Vec<ClientMessage>,
+    },
+    #[display("running")]
+    Running {
+        server_state: InitializeResult,
+        registrations: Vec<Registration>,
+    },
+    #[display("waiting shutdown")]
+    WaitingShutdown,
+    #[display("waiting exit")]
+    WaitingExit,
+}
+
 pub(crate) struct Translator {
     client: Client,
-    root_dir: Url,
-    messages: Vec<ClientMessage>,
-    initialize_result: Option<InitializeResult>,
-    is_initialized: bool,
-    is_shutdown: bool,
+    state: State,
 }
 
 impl Translator {
-    pub fn new(client: Client, root_dir: &Url) -> Self {
-        Self{client, root_dir: root_dir.clone(), messages: Vec::new(), initialize_result: None, is_initialized: false, is_shutdown: false}
+    pub fn new(client: Client, root_dir: Url) -> Self {
+        Self{client, state: State::Uninitialized{root_dir}}
     }
 
-    pub fn push_message(&mut self, message: ClientMessage) {
-        if !self.is_shutdown {
-            self.messages.push(message);
-        }
+    #[throws(TranslationError)]
+    pub fn send_message(&mut self, message: ClientMessage) {
+        self.process(Event::SendMessage(message))?
     }
 
     #[throws(TranslationError)]
     pub fn translate(&mut self) -> Option<ServerStatement> {
         let mut statement = None;
-        let mut delayed_messages = Vec::new();
-
-        for message in self.messages.drain(..) {
-            if self.is_initialized {
-                // Only exit may be sent prior to receiving initialize response.
-                if self.initialize_result.is_some() || message == ClientMessage::Notification(ClientNotification::Exit) {
-                    self.client.produce(message)?;
-                } else {
-                    delayed_messages.push(message);
-                }
-            } else {
-                #[allow(deprecated)] // InitializeParams.root_path is required.
-                self.client.produce(ClientMessage::Request(ClientRequest::Initialize(
-                        InitializeParams {
-                            process_id: Some(u64::from(process::id())),
-                            root_path: None,
-                            root_uri: Some(self.root_dir.clone()),
-                            initialization_options: None,
-                            capabilities: ClientCapabilities {
-                                workspace: None,
-                                text_document: Some(TextDocumentClientCapabilities {
-                                    synchronization: Some(SynchronizationCapability {
-                                        dynamic_registration: None,
-                                        will_save: None,
-                                        will_save_wait_until: None,
-                                        did_save: None,
-                                    }),
-                                    completion: None,
-                                    hover: None,
-                                    signature_help: None,
-                                    references: None,
-                                    document_highlight: None,
-                                    document_symbol: None,
-                                    formatting: None,
-                                    range_formatting: None,
-                                    on_type_formatting: None,
-                                    declaration: None,
-                                    definition: None,
-                                    type_definition: None,
-                                    implementation: None,
-                                    code_action: None,
-                                    code_lens: None,
-                                    document_link: None,
-                                    color_provider: None,
-                                    rename: None,
-                                    publish_diagnostics: None,
-                                    folding_range: None,
-                                }),
-                                window: None,
-                                experimental: None,
-                            },
-                            trace: None,
-                            workspace_folders: None,
-                            client_info: None,
-                        },
-                        )))?;
-                    self.is_initialized = true;
-                    delayed_messages.push(message);
-            }
-        }
-
-        self.messages = delayed_messages;
 
         match self.client.consume() {
             Ok(message) => {
-                if let Some(transmission) = self.process(message) {
-                    self.client.produce(transmission)?;
+                match message {
+                    ServerMessage::Request { id, request } => {
+                        match request {
+                            ServerRequest::RegisterCapability(registration) => {
+                                self.process(Event::RegisterCapability(id, registration))?;
+                            }
+                        }
+                    }
+                    ServerMessage::Response(response) => match response {
+                        ServerResponse::Initialize(initialize) => {
+                            self.process(Event::Initialized(initialize))?;
+                        }
+                        ServerResponse::Shutdown => {
+                            self.process(Event::CompletedShutdown)?;
+                        }
+                    }
+                    ServerMessage::Notification(notification) => match notification {
+                        ServerNotification::PublishDiagnostics(diagnostics) => {
+                            // TODO: Send diagnostics to tool.
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -319,34 +307,121 @@ impl Translator {
         statement
     }
 
-    fn process(&mut self, input: ServerMessage) -> Option<ClientMessage> {
-        match input {
-            ServerMessage::Request { id, request } => {
-                match request {
-                    ServerRequest::RegisterCapability(registration) => {
-                        // TODO: Store that all files matching document_selector shall send did_save notifications to this server.
-                    }
+    #[throws(TranslationError)]
+    fn process(&mut self, event: Event) {
+        match &self.state {
+            State::Uninitialized{root_dir} => match event {
+                Event::SendMessage(message) => {
+                    #[allow(deprecated)] // InitializeParams.root_path is required.
+                    self.client.produce(ClientMessage::Request(ClientRequest::Initialize(
+                            InitializeParams {
+                                process_id: Some(u64::from(process::id())),
+                                root_path: None,
+                                root_uri: Some(root_dir.clone()),
+                                initialization_options: None,
+                                capabilities: ClientCapabilities {
+                                    workspace: None,
+                                    text_document: Some(TextDocumentClientCapabilities {
+                                        synchronization: Some(SynchronizationCapability {
+                                            dynamic_registration: None,
+                                            will_save: None,
+                                            will_save_wait_until: None,
+                                            did_save: None,
+                                        }),
+                                        completion: None,
+                                        hover: None,
+                                        signature_help: None,
+                                        references: None,
+                                        document_highlight: None,
+                                        document_symbol: None,
+                                        formatting: None,
+                                        range_formatting: None,
+                                        on_type_formatting: None,
+                                        declaration: None,
+                                        definition: None,
+                                        type_definition: None,
+                                        implementation: None,
+                                        code_action: None,
+                                        code_lens: None,
+                                        document_link: None,
+                                        color_provider: None,
+                                        rename: None,
+                                        publish_diagnostics: None,
+                                        folding_range: None,
+                                    }),
+                                    window: None,
+                                    experimental: None,
+                                },
+                                trace: None,
+                                workspace_folders: None,
+                                client_info: None,
+                            },
+                            )))?;
+                    self.state = State::WaitingInitialization { messages: vec![message] }
                 }
+                Event::Initialized(_) | Event::CompletedShutdown | Event::RegisterCapability(..) => {
+                    throw!(TranslationError::InvalidState(event, self.state.clone()));
+                }
+                Event::Exit => {
+                    self.client.produce(ClientMessage::Notification(ClientNotification::Exit))?;
+                    self.state = State::WaitingExit
+                }
+            }
+            State::WaitingInitialization{messages} => match event {
+                Event::SendMessage(message) => {
+                    let mut new_messages = messages.clone();
+                    new_messages.push(message);
+                    self.state = State::WaitingInitialization{messages: new_messages}
+                }
+                Event::Initialized(server_state) => {
+                    self.client.produce(ClientMessage::Notification(ClientNotification::Initialized))?;
 
-                Some(ClientMessage::Response{
-                    id,
-                    response: ClientResponse::RegisterCapability
-                })
-            }
-            ServerMessage::Response(response) => match response {
-                ServerResponse::Initialize(initialize) => {
-                    self.initialize_result = Some(initialize);
-                    Some(ClientMessage::Notification(ClientNotification::Initialized))
+                    for message in messages {
+                        self.client.produce(message.clone())?;
+                    }
+
+                    self.state = State::Running{server_state, registrations: Vec::new()}
                 }
-                ServerResponse::Shutdown => {
-                    self.is_shutdown = true;
-                    Some(ClientMessage::Notification(ClientNotification::Exit))
+                Event::CompletedShutdown | Event::RegisterCapability(..) => {
+                    throw!(TranslationError::InvalidState(event, self.state.clone()));
+                }
+                Event::Exit => {
+                    // TODO: Figure out how to handle this case.
                 }
             }
-            ServerMessage::Notification(notification) => match notification {
-                ServerNotification::PublishDiagnostics(diagnostics) => {
-                    // TODO: Send diagnostics to tool.
-                    None
+            State::Running{server_state, registrations} => match event {
+                Event::SendMessage(message) => {
+                    self.client.produce(message)?;
+                }
+                Event::RegisterCapability(id, register) => {
+                    let mut new_registrations = registrations.clone();
+                    new_registrations.append(&mut register.registrations.clone());
+                    self.state = State::Running{server_state: server_state.clone(), registrations: new_registrations};
+                    self.client.produce(ClientMessage::Response{
+                        id,
+                        response: ClientResponse::RegisterCapability
+                    })?;
+                }
+                Event::Initialized(_) | Event::CompletedShutdown => {
+                    throw!(TranslationError::InvalidState(event, self.state.clone()));
+                }
+                Event::Exit => {
+                    self.client.produce(ClientMessage::Request(ClientRequest::Shutdown))?;
+                    self.state = State::WaitingShutdown;
+                }
+            }
+            State::WaitingShutdown => match event {
+                Event::SendMessage(_) | Event::Initialized(_) | Event::Exit | Event::RegisterCapability(..) => {
+                    throw!(TranslationError::InvalidState(event, self.state.clone()));
+                }
+                Event::CompletedShutdown => {
+                    self.client.produce(ClientMessage::Notification(ClientNotification::Exit))?;
+                    self.state = State::WaitingExit;
+                }
+            }
+            State::WaitingExit => {
+                if event != Event::Exit {
+                    throw!(TranslationError::InvalidState(event, self.state.clone()));
                 }
             }
         }
@@ -366,10 +441,8 @@ impl Translator {
     }
 
     #[throws(TranslationError)]
-    pub fn shutdown(&self) {
-        if !self.is_shutdown {
-            self.client.produce(ClientMessage::Request(ClientRequest::Shutdown))?;
-        }
+    pub fn shutdown(&mut self) {
+        self.process(Event::Exit)?;
     }
 
     pub fn waiter(&self) -> &Waiter {
