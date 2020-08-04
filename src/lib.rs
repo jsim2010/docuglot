@@ -2,18 +2,38 @@ mod json_rpc;
 
 use {
     core::{
-        cell::{RefCell, Cell},
+        cell::{Cell, RefCell},
         convert::{TryFrom, TryInto},
     },
     enum_map::{enum_map, Enum},
     fehler::{throw, throws},
-    json_rpc::{Success, Kind, Object, Outcome, Id, Params, Method},
+    json_rpc::{Id, Kind, Method, Object, Outcome, Params, Success},
     log::{error, trace},
-    lsp_types::{Registration, PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem, RegistrationParams, notification::{PublishDiagnostics, Notification}, request::{Request, RegisterCapability}, InitializeParams, ClientCapabilities, InitializeResult, TextDocumentClientCapabilities, SynchronizationCapability, Url, DidOpenTextDocumentParams, DidCloseTextDocumentParams},
-    market::{io::Reader, ConsumeFailure, ClosedMarketError, Consumer, ComposeFrom, NonComposible, StripFrom, PermanentQueue, Producer, ProduceFailure, process::{CreateProcessError, WaitProcessError, Waiter, Process}, sync::{Releaser, Actuator}},
+    lsp_types::{
+        notification::{Notification, PublishDiagnostics},
+        request::{RegisterCapability, Request},
+        ClientCapabilities, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+        InitializeParams, InitializeResult, PublishDiagnosticsParams, Registration,
+        RegistrationParams, SynchronizationCapability, TextDocumentClientCapabilities,
+        TextDocumentIdentifier, TextDocumentItem, Url,
+    },
+    market::{
+        io::Reader,
+        process::{CreateProcessError, Process, WaitProcessError, Waiter},
+        sync::{Actuator, Releaser},
+        ClosedMarketError, ComposeFailure, ComposeFrom, ConsumeCompositeError, ConsumeFailure,
+        Consumer, PermanentQueue, ProduceFailure, ProducePartsError, Producer, StripFrom,
+    },
     parse_display::Display as ParseDisplay,
-    serde_json::{Number, Value, error::Error as SerdeJsonError},
-    std::{fmt::{self, Display}, sync::Arc, rc::Rc, thread::{self, JoinHandle}, process::{self, Command}},
+    serde_json::{error::Error as SerdeJsonError, Number, Value},
+    std::{
+        fmt::{self, Display},
+        process::{self, Command},
+        rc::Rc,
+        str::Utf8Error,
+        sync::Arc,
+        thread::{self, JoinHandle},
+    },
     thiserror::Error as ThisError,
 };
 
@@ -21,6 +41,8 @@ use {
 static HEADER_CONTENT_LENGTH: &str = "Content-Length";
 /// The end of the header.
 static HEADER_END: &str = "\r\n\r\n";
+static HEADER_FIELD_DELIMITER: &str = "\r\n";
+static HEADER_FIELD_NAME_DELIMITER: &str = ": ";
 
 /// The languages supported by docuglot.
 #[derive(Clone, Copy, Debug, Enum, ParseDisplay, PartialEq)]
@@ -60,25 +82,38 @@ impl Tongue {
     }
 
     #[throws(TranslationError)]
-    fn thread(root_dir: &Url, releaser: Releaser, outputs: Arc<PermanentQueue<ClientStatement>>, inputs: Arc<PermanentQueue<ServerStatement>>) {
-        let rust_translator = Rc::new(RefCell::new(Translator::new(Client::new(
-                Command::new("rust-analyzer"),
-                )?, root_dir.clone())));
+    fn thread(
+        root_dir: &Url,
+        releaser: Releaser,
+        outputs: Arc<PermanentQueue<ClientStatement>>,
+        inputs: Arc<PermanentQueue<ServerStatement>>,
+    ) {
+        let rust_translator = Rc::new(RefCell::new(Translator::new(
+            Client::new(Command::new("rust-analyzer"))?,
+            root_dir.clone(),
+        )));
         // TODO: Currently plaintext_translator is a hack to deal with all files that do not have a known language. Ideally, this would run its own language server.
-        let plaintext_translator = Rc::new(RefCell::new(Translator::new(Client::new(
-                Command::new("echo"),
-                )?, root_dir.clone())));
+        let plaintext_translator = Rc::new(RefCell::new(Translator::new(
+            Client::new(Command::new("echo"))?,
+            root_dir.clone(),
+        )));
         plaintext_translator.borrow_mut().state = State::WaitingExit;
         let translators = enum_map! {
             Language::Rust => Rc::clone(&rust_translator),
             Language::Plaintext => Rc::clone(&plaintext_translator),
         };
 
-        while !translators.values().map(|t| t.borrow().state == State::WaitingExit).all(|x| x) {
+        while !translators
+            .values()
+            .map(|t| t.borrow().state == State::WaitingExit)
+            .all(|x| x)
+        {
             let will_shutdown = releaser.consume().is_ok();
 
             for output in outputs.consume_all().unwrap() {
-                translators[output.language()].borrow_mut().send_message(output.into())?;
+                translators[output.language()]
+                    .borrow_mut()
+                    .send_message(output.into())?;
             }
 
             for (_, translator) in &translators {
@@ -137,21 +172,17 @@ pub enum ServerStatement {
 #[derive(Debug, ParseDisplay)]
 #[display("")]
 pub enum ClientStatement {
-    OpenDoc {
-        doc: TextDocumentItem,
-    },
-    CloseDoc {
-        doc: TextDocumentIdentifier,
-    },
+    OpenDoc { doc: TextDocumentItem },
+    CloseDoc { doc: TextDocumentIdentifier },
 }
 
 impl ClientStatement {
     pub fn open_doc(doc: TextDocumentItem) -> Self {
-        Self::OpenDoc{doc}
+        Self::OpenDoc { doc }
     }
 
     pub fn close_doc(doc: TextDocumentIdentifier) -> Self {
-        Self::CloseDoc{doc}
+        Self::CloseDoc { doc }
     }
 
     fn language(&self) -> Language {
@@ -162,8 +193,16 @@ impl ClientStatement {
 impl From<ClientStatement> for ClientMessage {
     fn from(value: ClientStatement) -> Self {
         match value {
-            ClientStatement::OpenDoc { doc } => Self::Notification(ClientNotification::OpenDoc(DidOpenTextDocumentParams{text_document: doc})),
-            ClientStatement::CloseDoc { doc } => Self::Notification(ClientNotification::CloseDoc(DidCloseTextDocumentParams{text_document: doc})),
+            ClientStatement::OpenDoc { doc } => {
+                Self::Notification(ClientNotification::OpenDoc(DidOpenTextDocumentParams {
+                    text_document: doc,
+                }))
+            }
+            ClientStatement::CloseDoc { doc } => {
+                Self::Notification(ClientNotification::CloseDoc(DidCloseTextDocumentParams {
+                    text_document: doc,
+                }))
+            }
         }
     }
 }
@@ -173,8 +212,14 @@ pub struct ErrorMessage {
     line: String,
 }
 
+#[derive(Debug, ThisError)]
+#[error("Error while composing error message")]
+pub struct ErrorMessageCompositionError;
+
 impl ComposeFrom<u8> for ErrorMessage {
-    #[throws(NonComposible)]
+    type Error = ErrorMessageCompositionError;
+
+    #[throws(ComposeFailure<Self::Error>)]
     fn compose_from(parts: &mut Vec<u8>) -> Self {
         if let Ok(s) = std::str::from_utf8_mut(parts) {
             if let Some(index) = s.find('\n') {
@@ -183,15 +228,15 @@ impl ComposeFrom<u8> for ErrorMessage {
                 let line = l.to_string();
                 *parts = new_parts.as_bytes().to_vec();
 
-                ErrorMessage {line}
+                ErrorMessage { line }
             } else {
                 // parts does not contain a new line.
-                throw!(NonComposible);
+                throw!(ErrorMessageCompositionError);
             }
         } else {
             // parts has some invalid uft8.
             *parts = Vec::new();
-            throw!(NonComposible);
+            throw!(ErrorMessageCompositionError);
         }
     }
 }
@@ -235,13 +280,9 @@ pub enum Event {
 #[derive(Clone, Debug, ParseDisplay, PartialEq)]
 pub enum State {
     #[display("uninitialized")]
-    Uninitialized{
-        root_dir: Url,
-    },
+    Uninitialized { root_dir: Url },
     #[display("waiting initialization")]
-    WaitingInitialization{
-        messages: Vec<ClientMessage>,
-    },
+    WaitingInitialization { messages: Vec<ClientMessage> },
     #[display("running")]
     Running {
         server_state: InitializeResult,
@@ -260,7 +301,10 @@ pub(crate) struct Translator {
 
 impl Translator {
     pub fn new(client: Client, root_dir: Url) -> Self {
-        Self{client, state: State::Uninitialized{root_dir}}
+        Self {
+            client,
+            state: State::Uninitialized { root_dir },
+        }
     }
 
     #[throws(TranslationError)]
@@ -275,13 +319,11 @@ impl Translator {
         match self.client.consume() {
             Ok(message) => {
                 match message {
-                    ServerMessage::Request { id, request } => {
-                        match request {
-                            ServerRequest::RegisterCapability(registration) => {
-                                self.process(Event::RegisterCapability(id, registration))?;
-                            }
+                    ServerMessage::Request { id, request } => match request {
+                        ServerRequest::RegisterCapability(registration) => {
+                            self.process(Event::RegisterCapability(id, registration))?;
                         }
-                    }
+                    },
                     ServerMessage::Response(response) => match response {
                         ServerResponse::Initialize(initialize) => {
                             self.process(Event::Initialized(initialize))?;
@@ -289,12 +331,12 @@ impl Translator {
                         ServerResponse::Shutdown => {
                             self.process(Event::CompletedShutdown)?;
                         }
-                    }
+                    },
                     ServerMessage::Notification(notification) => match notification {
                         ServerNotification::PublishDiagnostics(diagnostics) => {
                             // TODO: Send diagnostics to tool.
                         }
-                    }
+                    },
                 }
             }
             Err(error) => {
@@ -310,10 +352,11 @@ impl Translator {
     #[throws(TranslationError)]
     fn process(&mut self, event: Event) {
         match &self.state {
-            State::Uninitialized{root_dir} => match event {
+            State::Uninitialized { root_dir } => match event {
                 Event::SendMessage(message) => {
                     #[allow(deprecated)] // InitializeParams.root_path is required.
-                    self.client.produce(ClientMessage::Request(ClientRequest::Initialize(
+                    self.client
+                        .produce(ClientMessage::Request(ClientRequest::Initialize(
                             InitializeParams {
                                 process_id: Some(u64::from(process::id())),
                                 root_path: None,
@@ -356,31 +399,42 @@ impl Translator {
                                 workspace_folders: None,
                                 client_info: None,
                             },
-                            )))?;
-                    self.state = State::WaitingInitialization { messages: vec![message] }
+                        )))?;
+                    self.state = State::WaitingInitialization {
+                        messages: vec![message],
+                    }
                 }
-                Event::Initialized(_) | Event::CompletedShutdown | Event::RegisterCapability(..) => {
+                Event::Initialized(_)
+                | Event::CompletedShutdown
+                | Event::RegisterCapability(..) => {
                     throw!(TranslationError::InvalidState(event, self.state.clone()));
                 }
                 Event::Exit => {
-                    self.client.produce(ClientMessage::Notification(ClientNotification::Exit))?;
+                    self.client
+                        .produce(ClientMessage::Notification(ClientNotification::Exit))?;
                     self.state = State::WaitingExit
                 }
-            }
-            State::WaitingInitialization{messages} => match event {
+            },
+            State::WaitingInitialization { messages } => match event {
                 Event::SendMessage(message) => {
                     let mut new_messages = messages.clone();
                     new_messages.push(message);
-                    self.state = State::WaitingInitialization{messages: new_messages}
+                    self.state = State::WaitingInitialization {
+                        messages: new_messages,
+                    }
                 }
                 Event::Initialized(server_state) => {
-                    self.client.produce(ClientMessage::Notification(ClientNotification::Initialized))?;
+                    self.client
+                        .produce(ClientMessage::Notification(ClientNotification::Initialized))?;
 
                     for message in messages {
                         self.client.produce(message.clone())?;
                     }
 
-                    self.state = State::Running{server_state, registrations: Vec::new()}
+                    self.state = State::Running {
+                        server_state,
+                        registrations: Vec::new(),
+                    }
                 }
                 Event::CompletedShutdown | Event::RegisterCapability(..) => {
                     throw!(TranslationError::InvalidState(event, self.state.clone()));
@@ -388,37 +442,48 @@ impl Translator {
                 Event::Exit => {
                     // TODO: Figure out how to handle this case.
                 }
-            }
-            State::Running{server_state, registrations} => match event {
+            },
+            State::Running {
+                server_state,
+                registrations,
+            } => match event {
                 Event::SendMessage(message) => {
                     self.client.produce(message)?;
                 }
                 Event::RegisterCapability(id, register) => {
                     let mut new_registrations = registrations.clone();
                     new_registrations.append(&mut register.registrations.clone());
-                    self.state = State::Running{server_state: server_state.clone(), registrations: new_registrations};
-                    self.client.produce(ClientMessage::Response{
+                    self.state = State::Running {
+                        server_state: server_state.clone(),
+                        registrations: new_registrations,
+                    };
+                    self.client.produce(ClientMessage::Response {
                         id,
-                        response: ClientResponse::RegisterCapability
+                        response: ClientResponse::RegisterCapability,
                     })?;
                 }
                 Event::Initialized(_) | Event::CompletedShutdown => {
                     throw!(TranslationError::InvalidState(event, self.state.clone()));
                 }
                 Event::Exit => {
-                    self.client.produce(ClientMessage::Request(ClientRequest::Shutdown))?;
+                    self.client
+                        .produce(ClientMessage::Request(ClientRequest::Shutdown))?;
                     self.state = State::WaitingShutdown;
                 }
-            }
+            },
             State::WaitingShutdown => match event {
-                Event::SendMessage(_) | Event::Initialized(_) | Event::Exit | Event::RegisterCapability(..) => {
+                Event::SendMessage(_)
+                | Event::Initialized(_)
+                | Event::Exit
+                | Event::RegisterCapability(..) => {
                     throw!(TranslationError::InvalidState(event, self.state.clone()));
                 }
                 Event::CompletedShutdown => {
-                    self.client.produce(ClientMessage::Notification(ClientNotification::Exit))?;
+                    self.client
+                        .produce(ClientMessage::Notification(ClientNotification::Exit))?;
                     self.state = State::WaitingExit;
                 }
-            }
+            },
             State::WaitingExit => {
                 if event != Event::Exit {
                     throw!(TranslationError::InvalidState(event, self.state.clone()));
@@ -486,7 +551,12 @@ impl Consumer for Client {
 
     #[throws(ConsumeFailure<Self::Error>)]
     fn consume(&self) -> Self::Good {
-        let good = self.server.consume().map_err(ConsumeFailure::map_into)?.try_into().map_err(|error| ConsumeFailure::Error(Self::Error::from(error)))?;
+        let good = self
+            .server
+            .consume()
+            .map_err(ConsumeFailure::map_into)?
+            .try_into()
+            .map_err(|error| ConsumeFailure::Error(Self::Error::from(error)))?;
         trace!("LSP Rx: {}", good);
         good
     }
@@ -501,11 +571,13 @@ impl Producer for Client {
         trace!("LSP Tx: {}", good);
         let message = Message::from(match good {
             ClientMessage::Response { id, response } => Object::response(id, response),
-            ClientMessage::Request(request) =>  Object::request(self.next_id(), request),
+            ClientMessage::Request(request) => Object::request(self.next_id(), request),
             ClientMessage::Notification(notification) => Object::notification(notification),
         });
 
-        self.server.produce(message).map_err(ProduceFailure::map_into)?
+        self.server
+            .produce(message)
+            .map_err(ProduceFailure::map_into)?
     }
 }
 
@@ -515,10 +587,7 @@ pub(crate) enum ServerMessage {
     #[display("Response: {0}")]
     Response(ServerResponse),
     #[display("Request[{id:?}]: {request}")]
-    Request {
-        id: Id,
-        request: ServerRequest,
-    },
+    Request { id: Id, request: ServerRequest },
     #[display("Notification: {0}")]
     Notification(ServerNotification),
 }
@@ -533,20 +602,19 @@ impl TryFrom<Message> for ServerMessage {
                 id: Some(request_id),
                 method,
                 params,
-            } => Self::Request { id : request_id , request: ServerRequest::new(method, params)?},
+            } => Self::Request {
+                id: request_id,
+                request: ServerRequest::new(method, params)?,
+            },
             Kind::Request {
                 id: None,
                 method,
                 params,
-            } => {
-                Self::Notification(ServerNotification::new(method, params)?)
-            }
+            } => Self::Notification(ServerNotification::new(method, params)?),
             Kind::Response {
                 outcome: Outcome::Result(value),
                 ..
-            } => {
-                Self::Response(value.try_into()?)
-            }
+            } => Self::Response(value.try_into()?),
         }
     }
 }
@@ -561,7 +629,15 @@ impl ServerNotification {
     #[throws(UnknownServerMessageFailure)]
     fn new(method: String, params: Params) -> Self {
         match method.as_str() {
-            <PublishDiagnostics as Notification>::METHOD => Self::PublishDiagnostics(serde_json::from_value::<PublishDiagnosticsParams>(params.clone().into()).map_err(|error| UnknownServerMessageFailure::InvalidParams{method, params, error})?),
+            <PublishDiagnostics as Notification>::METHOD => Self::PublishDiagnostics(
+                serde_json::from_value::<PublishDiagnosticsParams>(params.clone().into()).map_err(
+                    |error| UnknownServerMessageFailure::InvalidParams {
+                        method,
+                        params,
+                        error,
+                    },
+                )?,
+            ),
             _ => throw!(UnknownServerMessageFailure::UnknownMethod(method)),
         }
     }
@@ -577,7 +653,15 @@ impl ServerRequest {
     #[throws(UnknownServerMessageFailure)]
     fn new(method: String, params: Params) -> Self {
         match method.as_str() {
-            <RegisterCapability as Request>::METHOD => ServerRequest::RegisterCapability(serde_json::from_value::<RegistrationParams>(params.clone().into()).map_err(|error| UnknownServerMessageFailure::InvalidParams{method, params, error})?),
+            <RegisterCapability as Request>::METHOD => ServerRequest::RegisterCapability(
+                serde_json::from_value::<RegistrationParams>(params.clone().into()).map_err(
+                    |error| UnknownServerMessageFailure::InvalidParams {
+                        method,
+                        params,
+                        error,
+                    },
+                )?,
+            ),
             _ => throw!(UnknownServerMessageFailure::UnknownMethod(method)),
         }
     }
@@ -609,20 +693,21 @@ impl TryFrom<Value> for ServerResponse {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientMessage {
     Request(ClientRequest),
-    Response {
-        id: Id,
-        response: ClientResponse,
-    },
+    Response { id: Id, response: ClientResponse },
     Notification(ClientNotification),
 }
 
 impl Display for ClientMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", match self {
-            Self::Request(request) => format!("{}: {}", "Request", request),
-            Self::Response{response, ..} => format!("{}: {}", "Response", response),
-            Self::Notification(notification) => format!("{}: {}", "Notification", notification),
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Request(request) => format!("{}: {}", "Request", request),
+                Self::Response { response, .. } => format!("{}: {}", "Response", response),
+                Self::Notification(notification) => format!("{}: {}", "Notification", notification),
+            }
+        )
     }
 }
 
@@ -638,7 +723,8 @@ impl Method for ClientRequest {
         match self {
             Self::Initialize(_) => "initialize",
             Self::Shutdown => "shutdown",
-        }.to_string()
+        }
+        .to_string()
     }
 
     fn params(&self) -> Params {
@@ -666,7 +752,8 @@ impl Method for ClientNotification {
             Self::Exit => "exit",
             Self::OpenDoc(_) => "textDocument/didOpen",
             Self::CloseDoc(_) => "textDocument/didClose",
-        }.to_string()
+        }
+        .to_string()
     }
 
     fn params(&self) -> Params {
@@ -692,6 +779,17 @@ impl Success for ClientResponse {
     }
 }
 
+#[derive(Debug, ThisError)]
+pub enum ComposeMessageError {
+    #[error(transparent)]
+    Utf8(#[from] Utf8Error),
+    #[error("Header is missing content length")]
+    MissingContentLength,
+    #[error("none")]
+    None,
+}
+
+/// Represents an LSP message.
 #[derive(Debug, ParseDisplay)]
 #[display("{content}")]
 pub(crate) struct Message {
@@ -699,127 +797,94 @@ pub(crate) struct Message {
     content: Object,
 }
 
-//impl Message {
-//    /// Creates a new [`Message`].
-//    fn new(object: Object) -> Self {
-//        Self {
-//            object,
-//        }
-//    }
-//
-//    pub fn object(&self) -> &Object {
-//        &self.object
-//    }
-//
-//    /// Creates an LSP Request Message.
-//    #[throws(SerdeJsonError)]
-//    pub fn request<T>(params: T::Params, id: Id) -> Self
-//    where
-//        T: Request,
-//        <T as Request>::Params: Serialize,
-//    {
-//        Object::request::<T>(id, params).map(Self::new)?
-//    }
-//
-//    /// Creates an LSP Notification Message.
-//    #[throws(SerdeJsonError)]
-//    pub fn notification<T>(params: T::Params) -> Self
-//    where
-//        T: Notification,
-//        <T as Notification>::Params: Serialize,
-//    {
-//        Object::notification::<T>(params).map(Self::new)?
-//    }
-//
-//    /// Creates an LSP Response Message.
-//    #[throws(SerdeJsonError)]
-//    pub fn response<T>(result: T::Result, id: Id) -> Self
-//    where
-//        T: Request,
-//        <T as Request>::Result: Serialize,
-//    {
-//        Object::response::<T>(result, id).map(Self::new)?
-//    }
-//}
+impl Message {
+    fn header(string: &str) -> Option<&str> {
+        string
+            .find(HEADER_END)
+            .and_then(|header_length| string.get(..header_length))
+    }
+}
 
 impl ComposeFrom<u8> for Message {
-    #[throws(NonComposible)]
+    type Error = ComposeMessageError;
+
+    #[throws(ComposeFailure<ComposeMessageError>)]
     fn compose_from(parts: &mut Vec<u8>) -> Self {
         let mut length = 0;
 
-        let object: Option<Object> = std::str::from_utf8(parts).ok().and_then(|buffer| {
-            buffer.find(HEADER_END).and_then(|header_length| {
-                let mut content_length: Option<usize> = None;
+        let string = std::str::from_utf8(parts).map_err(Self::Error::from)?;
+        let header = Self::header(string).ok_or(ComposeFailure::Incomplete)?;
+        let header_len = header.len() + HEADER_END.len();
 
-                buffer.get(..header_length).and_then(|header| {
-                    let content_start = header_length.saturating_add(HEADER_END.len());
+        let mut content_length: Option<usize> = None;
 
-                    for field in header.split("\r\n") {
-                        let mut items = field.split(": ");
+        let object: Option<Object> = {
+            for field in header.split(HEADER_FIELD_DELIMITER) {
+                let mut items = field.split(": ");
 
-                        if items.next() == Some(HEADER_CONTENT_LENGTH) {
-                            if let Some(content_length_str) = items.next() {
-                                if let Ok(value) = content_length_str.parse() {
-                                    content_length = Some(value);
-                                }
-                            }
-
-                            break;
+                if items.next() == Some(HEADER_CONTENT_LENGTH) {
+                    if let Some(content_length_str) = items.next() {
+                        if let Ok(value) = content_length_str.parse() {
+                            content_length = Some(value);
                         }
                     }
 
-                    match content_length {
-                        None => {
-                            length = header_length;
+                    break;
+                }
+            }
+
+            match content_length {
+                None => {
+                    length = header_len;
+                    None
+                }
+                Some(content_length) => {
+                    if let Some(total_len) = header_len.checked_add(content_length) {
+                        if parts.len() < total_len {
+                            None
+                        } else if let Some(content) = string.get(header_len..total_len) {
+                            length = total_len;
+                            serde_json::from_str(content).ok()
+                        } else {
+                            length = header_len;
                             None
                         }
-                        Some(content_length) => {
-                            if let Some(total_len) = content_start.checked_add(content_length) {
-                                if parts.len() < total_len {
-                                    None
-                                } else if let Some(content) = buffer.get(content_start..total_len) {
-                                    length = total_len;
-                                    serde_json::from_str(content).ok()
-                                } else {
-                                    length = content_start;
-                                    None
-                                }
-                            } else {
-                                length = content_start;
-                                None
-                            }
-                        }
+                    } else {
+                        length = header_len;
+                        None
                     }
-                })
-            })
-        });
+                }
+            }
+        };
 
         let _ = parts.drain(..length);
-        object.ok_or(NonComposible)?.into()
+        object.ok_or(ComposeMessageError::None)?.into()
     }
 }
 
 impl From<Object> for Message {
     fn from(value: Object) -> Self {
-        Self {
-            content: value,
-        }
+        Self { content: value }
     }
 }
 
 impl StripFrom<Message> for u8 {
-    fn strip_from(good: &Message) -> Vec<Self> {
-        serde_json::to_string(&good.content).map_or(Vec::new(), |content| {
-            format!(
-                "{}: {}{}{}",
-                HEADER_CONTENT_LENGTH,
-                content.len(),
-                HEADER_END,
-                content
-            )
-            .as_bytes()
-            .to_vec()
-        })
+    type Error = SerdeJsonError;
+
+    #[throws(Self::Error)]
+    fn strip_from(good: Message) -> Vec<Self> {
+        let content = serde_json::to_string(&good.content)?;
+
+        format!(
+            "{}{}{}{}{}",
+            HEADER_CONTENT_LENGTH,
+            HEADER_FIELD_NAME_DELIMITER,
+            content.len(),
+            HEADER_END,
+            content
+        )
+        .as_bytes()
+        .to_vec()
     }
 }
 
@@ -837,8 +902,8 @@ pub enum UnknownServerMessageFailure {
     Response(#[from] UnknownServerResponseFailure),
     #[error("Unknown method: {0}")]
     UnknownMethod(String),
-    #[error("Unable to convert `{method}` from `{params}: {error}`")]
-    InvalidParams{
+    #[error("Unable to convert `{method}` from `{params}`: {error}")]
+    InvalidParams {
         method: String,
         params: Params,
         #[source]
@@ -853,7 +918,7 @@ pub struct UnknownServerResponseFailure;
 #[derive(Debug, ThisError)]
 pub enum ConsumeServerMessageFailure {
     #[error(transparent)]
-    ClosedServer(#[from] ClosedMarketError),
+    ClosedServer(#[from] ConsumeCompositeError<ComposeMessageError, ClosedMarketError>),
     #[error(transparent)]
     UnknownServerMessage(#[from] UnknownServerMessageFailure),
 }
@@ -861,7 +926,5 @@ pub enum ConsumeServerMessageFailure {
 #[derive(Debug, ThisError)]
 pub enum ProduceClientMessageFailure {
     #[error(transparent)]
-    Serialize(#[from] SerdeJsonError),
-    #[error(transparent)]
-    ClosedServer(#[from] ClosedMarketError),
+    ClosedServer(#[from] ProducePartsError<SerdeJsonError, ClosedMarketError>),
 }

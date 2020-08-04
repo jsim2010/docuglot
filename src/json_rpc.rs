@@ -35,8 +35,7 @@ impl Object {
     }
 
     /// Creates a Request object.
-    pub(crate) fn request<M: Method>(id: Id, method: M) -> Self
-    {
+    pub(crate) fn request<M: Method>(id: Id, method: M) -> Self {
         Self::new(Kind::Request {
             method: method.method(),
             params: method.params(),
@@ -45,8 +44,7 @@ impl Object {
     }
 
     /// Creates a Notification object.
-    pub(crate) fn notification<M: Method>(method: M) -> Self
-    {
+    pub(crate) fn notification<M: Method>(method: M) -> Self {
         Self::new(Kind::Request {
             method: method.method(),
             params: method.params(),
@@ -55,8 +53,7 @@ impl Object {
     }
 
     /// Creates a Response object.
-    pub(crate) fn response<S: Success>(id: Id, success: S) -> Self
-    {
+    pub(crate) fn response<S: Success>(id: Id, success: S) -> Self {
         Self::new(Kind::Response {
             id,
             outcome: Outcome::Result(success.result()),
@@ -88,11 +85,23 @@ pub(crate) enum Kind {
 
 impl Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", match self {
-            Self::Request { id: Some(id), method, params } => format!("Request[{}]: {} w/ {}", id, method, params),
-            Self::Request { id: None, method , params} => format!("Notification: {} w/ {}", method, params),
-            Self::Response { outcome, id } => format!("Response[{}]: {}", id, outcome),
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Request {
+                    id: Some(id),
+                    method,
+                    params,
+                } => format!("Request[{}]: {} w/ {}", id, method, params),
+                Self::Request {
+                    id: None,
+                    method,
+                    params,
+                } => format!("Notification: {} w/ {}", method, params),
+                Self::Response { outcome, id } => format!("Response[{}]: {}", id, outcome),
+            }
+        )
     }
 }
 
@@ -169,5 +178,5 @@ impl From<u64> for Id {
 enum Version {
     /// Version 2.0.
     #[serde(rename = "2.0")]
-    V2_0
+    V2_0,
 }
