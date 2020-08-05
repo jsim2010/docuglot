@@ -314,8 +314,6 @@ impl Translator {
 
     #[throws(TranslationError)]
     pub fn translate(&mut self) -> Option<ServerStatement> {
-        let mut statement = None;
-
         match self.client.consume() {
             Ok(message) => {
                 match message {
@@ -333,7 +331,7 @@ impl Translator {
                         }
                     },
                     ServerMessage::Notification(notification) => match notification {
-                        ServerNotification::PublishDiagnostics(diagnostics) => {
+                        ServerNotification::PublishDiagnostics(_diagnostics) => {
                             // TODO: Send diagnostics to tool.
                         }
                     },
@@ -346,7 +344,7 @@ impl Translator {
             }
         }
 
-        statement
+        None
     }
 
     #[throws(TranslationError)]

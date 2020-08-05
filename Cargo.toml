@@ -3,6 +3,12 @@ name = "docuglot"
 version = "0.1.0"
 authors = ["Justin Simerly <justin.simerly@endress.com>"]
 edition = "2018"
+description = "A Language Server Protocol translator for clients."
+license = "MIT"
+repository = "https://github.com/jsim2010/docuglot.git"
+readme = "README.md"
+keywords = ["language server protocol"]
+categories = ["text-editors"]
 
 [dependencies]
 enum-map = "0.6.2"
