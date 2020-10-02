@@ -7,7 +7,7 @@ description = "A Language Server Protocol translator for clients."
 license = "MIT"
 repository = "https://github.com/jsim2010/docuglot.git"
 readme = "README.md"
-keywords = ["language server protocol"]
+keywords = ["lsp", "lanugage", "server", "protocol"]
 categories = ["text-editors"]
 
 [dependencies]
