@@ -1,7 +1,7 @@
 [package]
 name = "docuglot"
 version = "0.1.0"
-authors = ["Justin Simerly <justin.simerly@endress.com>"]
+authors = ["Justin Simerly <jsim2010@gmail.com>"]
 edition = "2018"
 description = "A Language Server Protocol translator for clients."
 license = "MIT"
@@ -11,11 +11,13 @@ keywords = ["language server protocol"]
 categories = ["text-editors"]
 
 [dependencies]
+conventus = "0.2.0"
+cur = "0.4.0"
 enum-map = "0.6.2"
 fehler = "1.0.0"
 log = { version = "0.4.8", features = ["serde"] }
 lsp-types = "0.77.0"
-market = "0.18.0"
+market = "0.19.0"
 parse-display = "0.1.1"
 serde = "1.0.104"
 serde_json = "1.0"

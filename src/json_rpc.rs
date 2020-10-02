@@ -1,3 +1,4 @@
+//! Implements JSON-RPC functionality.
 use {
     core::fmt::{self, Debug, Display},
     parse_display::Display as ParseDisplay,
@@ -5,12 +6,17 @@ use {
     serde_json::{Map, Number, Value},
 };
 
+/// Represents a JSON-RPC method.
 pub(crate) trait Method {
+    /// Returns the method of `self`.
     fn method(&self) -> String;
+    /// Returns the parameters of `self`.
     fn params(&self) -> Params;
 }
 
+/// Represents a successful method completion.
 pub(crate) trait Success {
+    /// Returns the result of `self`.
     fn result(&self) -> Value;
 }
 
@@ -27,7 +33,7 @@ pub(crate) struct Object {
 
 impl Object {
     /// Creates a new `Object`.
-    pub(crate) fn new(kind: Kind) -> Self {
+    pub(crate) const fn new(kind: Kind) -> Self {
         Self {
             jsonrpc: Version::V2_0,
             kind,
@@ -35,7 +41,7 @@ impl Object {
     }
 
     /// Creates a Request object.
-    pub(crate) fn request<M: Method>(id: Id, method: M) -> Self {
+    pub(crate) fn request<M: Method>(id: Id, method: &M) -> Self {
         Self::new(Kind::Request {
             method: method.method(),
             params: method.params(),
@@ -44,7 +50,7 @@ impl Object {
     }
 
     /// Creates a Notification object.
-    pub(crate) fn notification<M: Method>(method: M) -> Self {
+    pub(crate) fn notification<M: Method>(method: &M) -> Self {
         Self::new(Kind::Request {
             method: method.method(),
             params: method.params(),
@@ -53,7 +59,7 @@ impl Object {
     }
 
     /// Creates a Response object.
-    pub(crate) fn response<S: Success>(id: Id, success: S) -> Self {
+    pub(crate) fn response<S: Success>(id: Id, success: &S) -> Self {
         Self::new(Kind::Response {
             id,
             outcome: Outcome::Result(success.result()),
@@ -67,7 +73,9 @@ impl Object {
 pub(crate) enum Kind {
     /// A JSON-RPC Request object.
     Request {
+        /// The method.
         method: String,
+        /// The parameters of `method.
         params: Params,
         /// The id.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,12 +128,16 @@ pub(crate) enum Outcome {
     Result(Value),
 }
 
+/// The parameters of a JSON-RPC method.
 #[derive(Clone, Debug, Deserialize, ParseDisplay, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Params {
+    /// Represents no parameters.
     None,
+    /// Represents an array of parameters.
     #[display("{0:?}")]
     Array(Vec<Value>),
+    /// Represents a map of parameters.
     #[display("{0:?}")]
     Object(Map<String, Value>),
 }
@@ -142,6 +154,7 @@ impl From<Value> for Params {
 }
 
 impl From<Params> for Value {
+    #[inline]
     fn from(value: Params) -> Self {
         match value {
             Params::None => Self::Null,
@@ -169,7 +182,7 @@ pub enum Id {
 
 impl From<u64> for Id {
     fn from(value: u64) -> Self {
-        Id::Num(value.into())
+        Self::Num(value.into())
     }
 }
 
