@@ -1,5 +1,6 @@
 //! A Language Server Protocol translator for clients.
 #![allow(clippy::unreachable)] // Unavoidable for Enum derivation.
+#![allow(clippy::pattern_type_mismatch)] // Marks enums as errors.
 mod json_rpc;
 mod lsp;
 
@@ -14,8 +15,8 @@ use {
     json_rpc::{Id, Method, Object, Params, Success},
     log::{error, trace},
     lsp::{
-        AssembleMessageError, Message, ServerMessage, ServerNotification, ServerRequest,
-        ServerResponse, UnknownServerMessageFailure,
+        Message, ServerMessage, ServerNotification, ServerRequest, ServerResponse,
+        UnknownServerMessageFailure,
     },
     lsp_types::{
         ClientCapabilities, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -24,11 +25,9 @@ use {
         TextDocumentItem, Url,
     },
     market::{
-        io::{Reader, WriteError},
+        io::{ReadError, Reader, WriteError},
         process::{CreateProcessError, Process, WaitProcessError, Waiter},
-        sync::{Actuator, Releaser},
-        ClosedMarketError, ConsumeCompositeError, ConsumeFailure, Consumer, Never, PermanentQueue,
-        ProduceFailure, Producer,
+        ConsumeFailure, Consumer, Never, PermanentQueue, ProduceFailure, Producer,
     },
     parse_display::Display as ParseDisplay,
     serde_json::{Number, Value},
@@ -56,9 +55,9 @@ pub enum Language {
 #[derive(Debug)]
 pub struct Tongue {
     /// The thread of Tongue.
-    thread: Option<JoinHandle<()>>,
+    thread: JoinHandle<()>,
     /// Triggers the Tongue thread to join.
-    join_actuator: Actuator,
+    joiner: Arc<market::sync::Trigger>,
     /// Outputs from the Translators.
     outputs: Arc<PermanentQueue<ClientStatement>>,
     /// Inputs to the Translators.
@@ -72,7 +71,8 @@ impl Tongue {
     #[inline]
     #[must_use]
     pub fn new(root_dir: &Url) -> Self {
-        let (join_actuator, releaser) = market::sync::trigger();
+        let joiner = Arc::new(market::sync::Trigger::new());
+        let shared_joiner = Arc::clone(&joiner);
         let dir = root_dir.clone();
         let outputs = Arc::new(PermanentQueue::new());
         let shared_outputs = Arc::clone(&outputs);
@@ -82,18 +82,18 @@ impl Tongue {
         let shared_statuses = Arc::clone(&statuses);
 
         Self {
-            join_actuator,
-            thread: Some(thread::spawn(move || {
+            joiner,
+            thread: thread::spawn(move || {
                 if let Err(error) = Self::thread(
                     &dir,
-                    &releaser,
+                    &shared_joiner,
                     &shared_outputs,
                     &shared_inputs,
                     &shared_statuses,
                 ) {
                     error!("tongue thread error: {}", error);
                 }
-            })),
+            }),
             outputs,
             inputs,
             statuses,
@@ -104,7 +104,7 @@ impl Tongue {
     #[throws(TranslationError)]
     fn thread(
         root_dir: &Url,
-        releaser: &Releaser,
+        joiner: &Arc<market::sync::Trigger>,
         outputs: &Arc<PermanentQueue<ClientStatement>>,
         inputs: &Arc<PermanentQueue<ServerStatement>>,
         statuses: &Arc<PermanentQueue<ExitStatus>>,
@@ -129,7 +129,7 @@ impl Tongue {
             .map(|t| t.borrow().state == State::WaitingExit)
             .all(|x| x)
         {
-            let will_shutdown = releaser.consume().is_ok();
+            let will_shutdown = joiner.is_triggered();
 
             for output in outputs.consume_all()? {
                 #[allow(clippy::indexing_slicing)]
@@ -158,25 +158,23 @@ impl Tongue {
     }
 
     /// Joins the thread.
-    #[allow(clippy::expect_used)] // Join API does not return a Result.
     #[inline]
-    pub fn join(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            self.join_actuator
-                .produce(())
-                .expect("Failed to trigger joining of Tongue");
+    pub fn join(&self) {
+        self.joiner.trigger();
 
-            thread.join().expect("Failed to join Tongue");
-        }
+        // TODO: This appears to cause an error currently.
+        //for _ in 0..2 {
+        //    self.statuses.consume().expect("Failed to finish translator");
+        //}
     }
 }
 
 impl Consumer for Tongue {
     type Good = ServerStatement;
-    type Error = <PermanentQueue<ServerStatement> as Consumer>::Error;
+    type Fault = <PermanentQueue<ServerStatement> as Consumer>::Fault;
 
     #[inline]
-    #[throws(ConsumeFailure<Self::Error>)]
+    #[throws(ConsumeFailure<Self::Fault>)]
     fn consume(&self) -> Self::Good {
         self.inputs.consume()?
     }
@@ -184,10 +182,10 @@ impl Consumer for Tongue {
 
 impl Producer for Tongue {
     type Good = ClientStatement;
-    type Error = <PermanentQueue<ClientStatement> as Producer>::Error;
+    type Fault = <PermanentQueue<ClientStatement> as Producer>::Fault;
 
     #[inline]
-    #[throws(ProduceFailure<Self::Error>)]
+    #[throws(ProduceFailure<Self::Fault>)]
     fn produce(&self, good: Self::Good) {
         self.outputs.produce(good)?
     }
@@ -319,7 +317,7 @@ pub enum TranslationError {
     Wait(#[from] WaitProcessError),
     /// Failure while collecting outputs.
     #[error(transparent)]
-    CollectOutputs(#[from] ConsumeFailure<<PermanentQueue<ClientMessage> as Consumer>::Error>),
+    CollectOutputs(#[from] ConsumeFailure<<PermanentQueue<ClientMessage> as Consumer>::Fault>),
     /// Attempted to process an event in an invalid state.
     #[error("Invalid state: Cannot {0} while {1}")]
     InvalidState(Box<Event>, State),
@@ -433,9 +431,9 @@ impl Translator {
                     },
                 }
             }
-            Err(error) => {
-                if let ConsumeFailure::Error(failure) = error {
-                    throw!(TranslationError::from(failure));
+            Err(failure) => {
+                if let ConsumeFailure::Fault(fault) = failure {
+                    throw!(TranslationError::from(fault));
                 }
             }
         }
@@ -446,8 +444,8 @@ impl Translator {
     /// Processes `event`.
     #[throws(TranslationError)]
     fn process(&mut self, event: Event) {
-        match &self.state {
-            State::Uninitialized { root_dir } => match event {
+        match self.state {
+            State::Uninitialized { ref root_dir } => match event {
                 Event::SendMessage(message) => {
                     self.client.initialize(root_dir)?;
                     self.state = State::WaitingInitialization {
@@ -468,7 +466,7 @@ impl Translator {
                     self.state = State::WaitingExit
                 }
             },
-            State::WaitingInitialization { messages } => match event {
+            State::WaitingInitialization { ref messages } => match event {
                 Event::SendMessage(message) => {
                     let mut new_messages = messages.clone();
                     new_messages.push(message);
@@ -500,8 +498,8 @@ impl Translator {
                 }
             },
             State::Running {
-                server_state,
-                registrations,
+                ref server_state,
+                ref registrations,
             } => match event {
                 Event::SendMessage(message) => {
                     self.client.produce(message)?;
@@ -675,16 +673,16 @@ impl Client {
 
 impl Consumer for Client {
     type Good = ServerMessage;
-    type Error = ConsumeServerMessageError;
+    type Fault = ConsumeServerMessageError;
 
-    #[throws(ConsumeFailure<Self::Error>)]
+    #[throws(ConsumeFailure<Self::Fault>)]
     fn consume(&self) -> Self::Good {
         let good = self
             .server
             .consume()
             .map_err(ConsumeFailure::map_into)?
             .try_into()
-            .map_err(|error| ConsumeFailure::Error(Self::Error::from(error)))?;
+            .map_err(|failure| ConsumeFailure::Fault(Self::Fault::from(failure)))?;
         trace!("LSP Rx: {}", good);
         good
     }
@@ -692,9 +690,9 @@ impl Consumer for Client {
 
 impl Producer for Client {
     type Good = ClientMessage;
-    type Error = WriteError<Message>;
+    type Fault = WriteError<Message>;
 
-    #[throws(ProduceFailure<Self::Error>)]
+    #[throws(ProduceFailure<Self::Fault>)]
     fn produce(&self, good: Self::Good) {
         trace!("LSP Tx: {}", good);
         let message = Message::from(match good {
@@ -731,10 +729,11 @@ impl Display for ClientMessage {
         write!(
             f,
             "{}",
-            match self {
-                Self::Request(request) => format!("{}: {}", "Request", request),
-                Self::Response { response, .. } => format!("{}: {}", "Response", response),
-                Self::Notification(notification) => format!("{}: {}", "Notification", notification),
+            match *self {
+                Self::Request(ref request) => format!("{}: {}", "Request", request),
+                Self::Response { ref response, .. } => format!("{}: {}", "Response", response),
+                Self::Notification(ref notification) =>
+                    format!("{}: {}", "Notification", notification),
             }
         )
     }
@@ -752,7 +751,7 @@ pub enum ClientRequest {
 
 impl Method for ClientRequest {
     fn method(&self) -> String {
-        match self {
+        match *self {
             Self::Initialize(_) => "initialize",
             Self::Shutdown => "shutdown",
         }
@@ -760,8 +759,8 @@ impl Method for ClientRequest {
     }
 
     fn params(&self) -> Params {
-        match self {
-            Self::Initialize(params) => {
+        match *self {
+            Self::Initialize(ref params) => {
                 #[allow(clippy::expect_used)] // InitializeParams can be serialized to JSON.
                 Params::from(
                     serde_json::to_value(params)
@@ -790,7 +789,7 @@ pub enum ClientNotification {
 
 impl Method for ClientNotification {
     fn method(&self) -> String {
-        match self {
+        match *self {
             Self::Initialized => "initialized",
             Self::Exit => "exit",
             Self::OpenDoc(_) => "textDocument/didOpen",
@@ -800,9 +799,9 @@ impl Method for ClientNotification {
     }
 
     fn params(&self) -> Params {
-        match self {
+        match *self {
             Self::Initialized | Self::Exit => Params::None,
-            Self::OpenDoc(params) => {
+            Self::OpenDoc(ref params) => {
                 #[allow(clippy::expect_used)]
                 // DidOpenTextDocumentParams can be serialized to JSON.
                 Params::from(
@@ -810,7 +809,7 @@ impl Method for ClientNotification {
                         .expect("Converting DidOpenTextDocumentParams to JSON Value"),
                 )
             }
-            Self::CloseDoc(params) => {
+            Self::CloseDoc(ref params) => {
                 #[allow(clippy::expect_used)]
                 // DidCloseTextDocumentParams can be serialized to JSON.
                 Params::from(
@@ -831,7 +830,7 @@ pub enum ClientResponse {
 
 impl Success for ClientResponse {
     fn result(&self) -> Value {
-        match self {
+        match *self {
             Self::RegisterCapability => Value::Null,
         }
     }
@@ -850,7 +849,7 @@ pub enum CreateClientError {
 pub enum ConsumeServerMessageError {
     /// Client failed to consume Message from server.
     #[error(transparent)]
-    Consume(#[from] ConsumeCompositeError<AssembleMessageError, ClosedMarketError>),
+    Consume(#[from] ReadError<Message>),
     /// Client failed to convert Message into ServerMessage.
     #[error(transparent)]
     UnknownServerMessage(#[from] UnknownServerMessageFailure),

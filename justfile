@@ -46,7 +46,7 @@ fix_format: _install_format
 # - clippy::empty_enum: recommended `!` type is not stable
 # - clippy::multiple_crate_versions: not fixable when caused by dependencies
 # - clippy::implicit_return: rust convention calls for implicit return
-# - clippy::redundant_pub_crate: conflicts with clippy::unreachable_pub
+# - clippy::redundant_pub_crate: conflicts with clippy::unreachable_pub. See https://github.com/rust-lang/rust-clippy/issues/5369.
 #
 # Lints the project source code
 lint: _install_lint
@@ -106,7 +106,7 @@ test:
     cargo test --verbose --all-features
 
 # Validates the project
-validate: (set_rust "1.46.0") validate_format validate_deps lint build test
+validate: (set_rust "1.47.0") validate_format validate_deps lint build test
 
 # Validates dependencies of the project
 validate_deps: _install_deps

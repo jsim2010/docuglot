@@ -215,6 +215,8 @@ impl AssembleFrom<u8> for Message {
                 ))
             }
             Some(content_length) => {
+                #[allow(clippy::option_if_let_else)]
+                // False trigger. See https://github.com/rust-lang/rust-clippy/issues/5822.
                 if let Some(total_len) = header_len.checked_add(content_length) {
                     if parts.len() < total_len {
                         Err(AssembleFailure::Incomplete)
