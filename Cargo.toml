@@ -1,6 +1,6 @@
 [package]
 name = "docuglot"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Justin Simerly <jsim2010@gmail.com>"]
 edition = "2018"
 description = "A Language Server Protocol translator for clients."
