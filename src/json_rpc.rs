@@ -1,10 +1,5 @@
 //! Implements JSON-RPC functionality.
-use {
-    core::fmt::{self, Debug, Display},
-    parse_display::Display as ParseDisplay,
-    serde::{Deserialize, Serialize},
-    serde_json::{Map, Number, Value},
-};
+use core::fmt::{self, Debug, Display};
 
 /// Represents a JSON-RPC method.
 pub(crate) trait Method {
@@ -17,11 +12,11 @@ pub(crate) trait Method {
 /// Represents a successful method completion.
 pub(crate) trait Success {
     /// Returns the result of `self`.
-    fn result(&self) -> Value;
+    fn result(&self) -> serde_json::Value;
 }
 
 /// A JSON-RPC object.
-#[derive(Clone, Debug, Deserialize, ParseDisplay, PartialEq, Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, parse_display::Display, PartialEq, serde::Serialize)]
 #[display("{kind}")]
 pub(crate) struct Object {
     /// The JSON version.
@@ -68,7 +63,7 @@ impl Object {
 }
 
 /// A type of JSON-RPC object.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub(crate) enum Kind {
     /// A JSON-RPC Request object.
@@ -120,40 +115,42 @@ impl From<Object> for Kind {
 }
 
 /// The outcome contained in a JSON-RPC Response.
-#[derive(Clone, Debug, Deserialize, ParseDisplay, PartialEq, Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, parse_display::Display, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Outcome {
     #[display("Success {0}")]
     /// A successful outcome.
-    Result(Value),
+    Result(serde_json::Value),
 }
 
 /// The parameters of a JSON-RPC method.
-#[derive(Clone, Debug, Deserialize, ParseDisplay, PartialEq, Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, parse_display::Display, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum Params {
     /// Represents no parameters.
     None,
     /// Represents an array of parameters.
     #[display("{0:?}")]
-    Array(Vec<Value>),
+    Array(Vec<serde_json::Value>),
     /// Represents a map of parameters.
     #[display("{0:?}")]
-    Object(Map<String, Value>),
+    Object(serde_json::Map<String, serde_json::Value>),
 }
 
-impl From<Value> for Params {
-    fn from(value: Value) -> Self {
+impl From<serde_json::Value> for Params {
+    fn from(value: serde_json::Value) -> Self {
         match value {
-            Value::Null => Self::None,
-            Value::Bool(_) | Value::Number(_) | Value::String(_) => Self::Array(vec![value]),
-            Value::Array(seq) => Self::Array(seq),
-            Value::Object(map) => Self::Object(map),
+            serde_json::Value::Null => Self::None,
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => Self::Array(vec![value]),
+            serde_json::Value::Array(seq) => Self::Array(seq),
+            serde_json::Value::Object(map) => Self::Object(map),
         }
     }
 }
 
-impl From<Params> for Value {
+impl From<Params> for serde_json::Value {
     #[inline]
     fn from(value: Params) -> Self {
         match value {
@@ -165,7 +162,9 @@ impl From<Params> for Value {
 }
 
 /// The identifier of a JSON-RPC Request.
-#[derive(Clone, Debug, Deserialize, Eq, ParseDisplay, PartialEq, Serialize)]
+#[derive(
+    Clone, Debug, serde::Deserialize, Eq, parse_display::Display, PartialEq, serde::Serialize,
+)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
 pub enum Id {
@@ -174,7 +173,7 @@ pub enum Id {
     Null,
     /// A numeric id.
     #[display("{0}")]
-    Num(Number),
+    Num(serde_json::Number),
     /// A string id.
     #[display("{0}")]
     Str(String),
@@ -187,7 +186,7 @@ impl From<u64> for Id {
 }
 
 /// The JSON-RPC protocol version.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 enum Version {
     /// Version 2.0.
     #[serde(rename = "2.0")]

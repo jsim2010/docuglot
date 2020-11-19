@@ -2,22 +2,13 @@
 // TODO: This should be moved to only occur on cur (functionality exists in master but not 1.46.0.
 #![allow(clippy::wildcard_imports)] // cur is designed to use wildcard import.
 use {
-    crate::json_rpc::{Id, Kind, Object, Outcome, Params},
-    conventus::{AssembleFailure, AssembleFrom, DisassembleFrom},
+    crate::json_rpc,
     core::{
         convert::{TryFrom, TryInto},
         fmt::Display,
+        str::Utf8Error,
     },
     fehler::{throw, throws},
-    lsp_types::{
-        notification::{Notification, PublishDiagnostics},
-        request::{RegisterCapability, Request},
-        InitializeResult, PublishDiagnosticsParams, RegistrationParams,
-    },
-    parse_display::Display as ParseDisplay,
-    serde_json::{error::Error as SerdeJsonError, Value},
-    std::str::Utf8Error,
-    thiserror::Error as ThisError,
 };
 
 use cur::*;
@@ -35,7 +26,7 @@ game!(TCHAR = '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' |
 game!(MESSAGE = ([(name @ [TCHAR; 1..], HEADER_FIELD_NAME_DELIMITER, (value @ [_; ..]), HEADER_FIELD_DELIMITER); 1..], "\r\n", content @ [_; ..]));
 
 /// A message from the language server.
-#[derive(Debug, ParseDisplay)]
+#[derive(Debug, parse_display::Display)]
 pub(crate) enum ServerMessage {
     /// A response.
     #[display("Response: {0}")]
@@ -44,7 +35,7 @@ pub(crate) enum ServerMessage {
     #[display("Request[{id:?}]: {request}")]
     Request {
         /// The id.
-        id: Id,
+        id: json_rpc::Id,
         /// The request.
         request: ServerRequest,
     },
@@ -59,7 +50,7 @@ impl TryFrom<Message> for ServerMessage {
     #[throws(Self::Error)]
     fn try_from(other: Message) -> Self {
         match other.content.into() {
-            Kind::Request {
+            json_rpc::Kind::Request {
                 id: Some(request_id),
                 method,
                 params,
@@ -67,13 +58,13 @@ impl TryFrom<Message> for ServerMessage {
                 id: request_id,
                 request: ServerRequest::new(method, params)?,
             },
-            Kind::Request {
+            json_rpc::Kind::Request {
                 id: None,
                 method,
                 params,
             } => Self::Notification(ServerNotification::new(method, params)?),
-            Kind::Response {
-                outcome: Outcome::Result(value),
+            json_rpc::Kind::Response {
+                outcome: json_rpc::Outcome::Result(value),
                 ..
             } => Self::Response(value.try_into()?),
         }
@@ -81,20 +72,20 @@ impl TryFrom<Message> for ServerMessage {
 }
 
 /// A notification from the server.
-#[derive(Debug, ParseDisplay)]
+#[derive(Debug, parse_display::Display)]
 pub(crate) enum ServerNotification {
     /// Sends diagnostics to the client.
     #[display("PublishDiagnostics({0:?})")]
-    PublishDiagnostics(PublishDiagnosticsParams),
+    PublishDiagnostics(lsp_types::PublishDiagnosticsParams),
 }
 
 impl ServerNotification {
     /// Creates a new `ServerNotification`.
     #[throws(UnknownServerMessageFailure)]
-    fn new(method: String, params: Params) -> Self {
+    fn new(method: String, params: json_rpc::Params) -> Self {
         match method.as_str() {
-            <PublishDiagnostics as Notification>::METHOD => Self::PublishDiagnostics(
-                serde_json::from_value::<PublishDiagnosticsParams>(params.clone().into()).map_err(
+            <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD => Self::PublishDiagnostics(
+                serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone().into()).map_err(
                     |error| UnknownServerMessageFailure::InvalidParams {
                         method,
                         params,
@@ -108,49 +99,50 @@ impl ServerNotification {
 }
 
 /// A reqeust from the server.
-#[derive(Debug, ParseDisplay)]
+#[derive(Debug, parse_display::Display)]
 pub(crate) enum ServerRequest {
     /// Registers capabilities with the client.
     #[display("RegisterCapability({0:?})")]
-    RegisterCapability(RegistrationParams),
+    RegisterCapability(lsp_types::RegistrationParams),
 }
 
 impl ServerRequest {
     /// Creates a new `ServerRequest`.
     #[throws(UnknownServerMessageFailure)]
-    fn new(method: String, params: Params) -> Self {
+    fn new(method: String, params: json_rpc::Params) -> Self {
         match method.as_str() {
-            <RegisterCapability as Request>::METHOD => Self::RegisterCapability(
-                serde_json::from_value::<RegistrationParams>(params.clone().into()).map_err(
-                    |error| UnknownServerMessageFailure::InvalidParams {
-                        method,
-                        params,
-                        error,
-                    },
-                )?,
-            ),
+            <lsp_types::request::RegisterCapability as lsp_types::request::Request>::METHOD => {
+                Self::RegisterCapability(
+                    serde_json::from_value::<lsp_types::RegistrationParams>(params.clone().into())
+                        .map_err(|error| UnknownServerMessageFailure::InvalidParams {
+                            method,
+                            params,
+                            error,
+                        })?,
+                )
+            }
             _ => throw!(UnknownServerMessageFailure::UnknownMethod(method)),
         }
     }
 }
 
 /// A response from the server.
-#[derive(Debug, ParseDisplay)]
+#[derive(Debug, parse_display::Display)]
 pub(crate) enum ServerResponse {
     /// Response to an initialization request.
     #[display("{0:?}")]
-    Initialize(InitializeResult),
+    Initialize(lsp_types::InitializeResult),
     /// Response to a shutdown request.
     Shutdown,
 }
 
-impl TryFrom<Value> for ServerResponse {
+impl TryFrom<serde_json::Value> for ServerResponse {
     type Error = UnknownServerResponseFailure;
 
     #[inline]
     #[throws(Self::Error)]
-    fn try_from(other: Value) -> Self {
-        if let Ok(result) = serde_json::from_value::<InitializeResult>(other.clone()) {
+    fn try_from(other: serde_json::Value) -> Self {
+        if let Ok(result) = serde_json::from_value::<lsp_types::InitializeResult>(other.clone()) {
             Self::Initialize(result)
         } else if serde_json::from_value::<()>(other).is_ok() {
             Self::Shutdown
@@ -161,11 +153,11 @@ impl TryFrom<Value> for ServerResponse {
 }
 
 /// Represents an LSP message.
-// Do not use ParseDisplay as this requires Object be public.
+// Do not use parse_display::Display as this requires Object be public.
 #[derive(Debug)]
 pub struct Message {
     /// The JSON-RPC object of the message.
-    content: Object,
+    content: json_rpc::Object,
 }
 
 impl Message {
@@ -177,17 +169,17 @@ impl Message {
     }
 }
 
-impl AssembleFrom<u8> for Message {
+impl conventus::AssembleFrom<u8> for Message {
     type Error = AssembleMessageError;
 
     #[inline]
-    #[throws(AssembleFailure<AssembleMessageError>)]
+    #[throws(conventus::AssembleFailure<AssembleMessageError>)]
     fn assemble_from(parts: &mut Vec<u8>) -> Self {
         // TODO: This would probably be simpler with a regex.
         let mut length = 0;
 
         let string = std::str::from_utf8(parts).map_err(Self::Error::from)?;
-        let header = Self::header(string).ok_or(AssembleFailure::Incomplete)?;
+        let header = Self::header(string).ok_or(conventus::AssembleFailure::Incomplete)?;
         // saturating_add will not reach end due to full header_len needing to exist in string.
         let header_len = header.len().saturating_add(HEADER_END.len());
         let mut content_length: Option<usize> = None;
@@ -207,10 +199,10 @@ impl AssembleFrom<u8> for Message {
         }
 
         // Cannot return from function until after parts.drain() is called.
-        let object: Result<Object, _> = match content_length {
+        let object: Result<json_rpc::Object, _> = match content_length {
             None => {
                 length = header_len;
-                Err(AssembleFailure::Error(
+                Err(conventus::AssembleFailure::Error(
                     AssembleMessageError::MissingContentLength,
                 ))
             }
@@ -219,21 +211,21 @@ impl AssembleFrom<u8> for Message {
                 // False trigger. See https://github.com/rust-lang/rust-clippy/issues/5822.
                 if let Some(total_len) = header_len.checked_add(content_length) {
                     if parts.len() < total_len {
-                        Err(AssembleFailure::Incomplete)
+                        Err(conventus::AssembleFailure::Incomplete)
                     } else if let Some(content) = string.get(header_len..total_len) {
                         length = total_len;
                         serde_json::from_str(content).map_err(|error| {
-                            AssembleFailure::Error(AssembleMessageError::from(error))
+                            conventus::AssembleFailure::Error(AssembleMessageError::from(error))
                         })
                     } else {
                         length = header_len;
-                        Err(AssembleFailure::Error(
+                        Err(conventus::AssembleFailure::Error(
                             AssembleMessageError::InvalidContentLength,
                         ))
                     }
                 } else {
                     length = header_len;
-                    Err(AssembleFailure::Error(
+                    Err(conventus::AssembleFailure::Error(
                         AssembleMessageError::InvalidContentLength,
                     ))
                 }
@@ -252,16 +244,16 @@ impl Display for Message {
     }
 }
 
-impl From<Object> for Message {
+impl From<json_rpc::Object> for Message {
     #[inline]
-    fn from(value: Object) -> Self {
+    fn from(value: json_rpc::Object) -> Self {
         Self { content: value }
     }
 }
 
 #[allow(clippy::use_self)] // False positive on format!.
-impl DisassembleFrom<Message> for u8 {
-    type Error = SerdeJsonError;
+impl conventus::DisassembleFrom<Message> for u8 {
+    type Error = serde_json::Error;
 
     #[inline]
     #[throws(Self::Error)]
@@ -282,7 +274,7 @@ impl DisassembleFrom<Message> for u8 {
 }
 
 /// Error while assembling a `Message`.
-#[derive(Debug, ThisError)]
+#[derive(Debug, thiserror::Error)]
 pub enum AssembleMessageError {
     /// Received bytes were not valid utf8.
     #[error(transparent)]
@@ -295,16 +287,16 @@ pub enum AssembleMessageError {
     InvalidContentLength,
     /// Unable to convert message.
     #[error("messge content is invalid: {0}")]
-    InvalidContent(#[from] SerdeJsonError),
+    InvalidContent(#[from] serde_json::Error),
 }
 
 /// Response from server is unknown.
-#[derive(Clone, Copy, Debug, ThisError)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("Unknown response from server")]
 pub struct UnknownServerResponseFailure;
 
 /// Message from server is unknown.
-#[derive(Debug, ThisError)]
+#[derive(Debug, thiserror::Error)]
 pub enum UnknownServerMessageFailure {
     /// Response is unknown.
     #[error(transparent)]
@@ -318,9 +310,9 @@ pub enum UnknownServerMessageFailure {
         /// The method.
         method: String,
         /// The parameters.
-        params: Params,
+        params: json_rpc::Params,
         /// The error.
         #[source]
-        error: SerdeJsonError,
+        error: serde_json::Error,
     },
 }

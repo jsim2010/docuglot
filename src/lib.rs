@@ -5,44 +5,23 @@ mod json_rpc;
 mod lsp;
 
 use {
-    conventus::{AssembleFailure, AssembleFrom},
     core::{
         cell::{Cell, RefCell},
         convert::TryInto,
-    },
-    enum_map::{enum_map, Enum},
-    fehler::{throw, throws},
-    json_rpc::{Id, Method, Object, Params, Success},
-    log::{error, trace},
-    lsp::{
-        Message, ServerMessage, ServerNotification, ServerRequest, ServerResponse,
-        UnknownServerMessageFailure,
-    },
-    lsp_types::{
-        ClientCapabilities, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-        InitializeParams, InitializeResult, Registration, RegistrationParams,
-        SynchronizationCapability, TextDocumentClientCapabilities, TextDocumentIdentifier,
-        TextDocumentItem, Url,
-    },
-    market::{
-        io::{ReadError, Reader, WriteError},
-        process::{CreateProcessError, Process, WaitProcessError, Waiter},
-        ConsumeFailure, Consumer, Never, PermanentQueue, ProduceFailure, Producer,
-    },
-    parse_display::Display as ParseDisplay,
-    serde_json::{Number, Value},
-    std::{
         fmt::{self, Display},
+    },
+    fehler::{throw, throws},
+    log::{error, trace},
+    market::{Consumer as _, Failure as _, Producer as _},
+    std::{
         process::{self, Command, ExitStatus},
         rc::Rc,
-        sync::Arc,
         thread::{self, JoinHandle},
     },
-    thiserror::Error as ThisError,
 };
 
 /// The languages supported by docuglot.
-#[derive(Clone, Copy, Debug, Enum, ParseDisplay, PartialEq)]
+#[derive(Clone, Copy, Debug, enum_map::Enum, parse_display::Display, PartialEq)]
 #[display(style = "lowercase")]
 pub enum Language {
     /// Rust.
@@ -57,57 +36,73 @@ pub struct Tongue {
     /// The thread of Tongue.
     thread: JoinHandle<()>,
     /// Triggers the Tongue thread to join.
-    joiner: Arc<market::sync::Trigger>,
-    /// Outputs from the Translators.
-    outputs: Arc<PermanentQueue<ClientStatement>>,
-    /// Inputs to the Translators.
-    inputs: Arc<PermanentQueue<ServerStatement>>,
+    joiner: market::sync::Trigger,
+    /// Produces statements to be sent to the Translators.
+    transmission_channel: market::channel::Crossbeam<ClientStatement>,
+    /// Consumes statements received from the Translators.
+    reception_channel: market::channel::Crossbeam<ServerStatement>,
     /// The statuses of the Translators.
-    statuses: Arc<PermanentQueue<ExitStatus>>,
+    status_consumer: market::channel::CrossbeamConsumer<ExitStatus>,
 }
 
 impl Tongue {
     /// Creates a new `Tongue`.
     #[inline]
-    #[must_use]
-    pub fn new(root_dir: &Url) -> Self {
-        let joiner = Arc::new(market::sync::Trigger::new());
-        let shared_joiner = Arc::clone(&joiner);
+    #[throws(market::TakenParticipant)]
+    pub fn new(root_dir: &lsp_types::Url) -> Self {
         let dir = root_dir.clone();
-        let outputs = Arc::new(PermanentQueue::new());
-        let shared_outputs = Arc::clone(&outputs);
-        let inputs = Arc::new(PermanentQueue::new());
-        let shared_inputs = Arc::clone(&inputs);
-        let statuses = Arc::new(PermanentQueue::new());
-        let shared_statuses = Arc::clone(&statuses);
+        let mut lock = market::sync::Lock::new();
+        let mut transmission_channel =
+            market::channel::Crossbeam::new(market::channel::Size::Infinite);
+        let mut reception_channel =
+            market::channel::Crossbeam::new(market::channel::Size::Infinite);
+        let mut status_channel = market::channel::Crossbeam::new(market::channel::Size::Infinite);
+        let hammer = lock.hammer()?;
+        let transmission_consumer = transmission_channel.consumer()?;
+        let reception_producer = reception_channel.producer()?;
+        let status_producer = status_channel.producer()?;
 
         Self {
-            joiner,
+            joiner: lock.trigger()?,
             thread: thread::spawn(move || {
                 if let Err(error) = Self::thread(
                     &dir,
-                    &shared_joiner,
-                    &shared_outputs,
-                    &shared_inputs,
-                    &shared_statuses,
+                    &hammer,
+                    &transmission_consumer,
+                    &reception_producer,
+                    &status_producer,
                 ) {
                     error!("tongue thread error: {}", error);
                 }
             }),
-            outputs,
-            inputs,
-            statuses,
+            transmission_channel,
+            reception_channel,
+            status_consumer: status_channel.consumer()?,
         }
+    }
+
+    /// Returns the consumer that consumes [`ServerStatement`]s.
+    #[inline]
+    #[throws(market::TakenParticipant)]
+    pub fn consumer(&mut self) -> market::channel::CrossbeamConsumer<ServerStatement> {
+        self.reception_channel.consumer()?
+    }
+
+    /// Returns the producer that produces [`ClientStatement`]s.
+    #[inline]
+    #[throws(market::TakenParticipant)]
+    pub fn producer(&mut self) -> market::channel::CrossbeamProducer<ClientStatement> {
+        self.transmission_channel.producer()?
     }
 
     /// The main thread of a Tongue.
     #[throws(TranslationError)]
     fn thread(
-        root_dir: &Url,
-        joiner: &Arc<market::sync::Trigger>,
-        outputs: &Arc<PermanentQueue<ClientStatement>>,
-        inputs: &Arc<PermanentQueue<ServerStatement>>,
-        statuses: &Arc<PermanentQueue<ExitStatus>>,
+        root_dir: &lsp_types::Url,
+        hammer: &market::sync::Hammer,
+        transmission_consumer: &market::channel::CrossbeamConsumer<ClientStatement>,
+        reception_producer: &market::channel::CrossbeamProducer<ServerStatement>,
+        status_producer: &market::channel::CrossbeamProducer<ExitStatus>,
     ) {
         let rust_translator = Rc::new(RefCell::new(Translator::new(
             Client::new(Command::new("rust-analyzer"))?,
@@ -119,7 +114,7 @@ impl Tongue {
             root_dir.clone(),
         )));
         plaintext_translator.borrow_mut().state = State::WaitingExit;
-        let translators = enum_map! {
+        let translators = enum_map::enum_map! {
             Language::Rust => Rc::clone(&rust_translator),
             Language::Plaintext => Rc::clone(&plaintext_translator),
         };
@@ -129,19 +124,19 @@ impl Tongue {
             .map(|t| t.borrow().state == State::WaitingExit)
             .all(|x| x)
         {
-            let will_shutdown = joiner.is_triggered();
+            let will_shutdown = hammer.consume().is_ok();
 
-            for output in outputs.consume_all()? {
+            for transmission in transmission_consumer.consume_all()? {
                 #[allow(clippy::indexing_slicing)]
                 // translators is an EnumMap so index will not panic.
-                translators[output.language()]
+                translators[transmission.language()]
                     .borrow_mut()
-                    .send_message(output.into())?;
+                    .send_message(transmission.into())?;
             }
 
             for (_, translator) in &translators {
                 if let Some(input) = translator.borrow_mut().translate()? {
-                    inputs.produce(input)?;
+                    reception_producer.produce(input)?;
                 }
 
                 translator.borrow().log_errors();
@@ -153,46 +148,25 @@ impl Tongue {
         }
 
         for (_, translator) in translators {
-            statuses.produce(translator.borrow().waiter().demand()?)?;
+            status_producer.produce(translator.borrow().waiter().demand()?)?;
         }
     }
 
     /// Joins the thread.
     #[inline]
+    #[throws(market::ProduceFailure<market::channel::DisconnectedFault>)]
     pub fn join(&self) {
-        self.joiner.trigger();
+        self.joiner.produce(())?;
 
         // TODO: This appears to cause an error currently.
         //for _ in 0..2 {
-        //    self.statuses.consume().expect("Failed to finish translator");
+        //    self.status_consumer.consume().expect("Failed to finish translator");
         //}
     }
 }
 
-impl Consumer for Tongue {
-    type Good = ServerStatement;
-    type Fault = <PermanentQueue<ServerStatement> as Consumer>::Fault;
-
-    #[inline]
-    #[throws(ConsumeFailure<Self::Fault>)]
-    fn consume(&self) -> Self::Good {
-        self.inputs.consume()?
-    }
-}
-
-impl Producer for Tongue {
-    type Good = ClientStatement;
-    type Fault = <PermanentQueue<ClientStatement> as Producer>::Fault;
-
-    #[inline]
-    #[throws(ProduceFailure<Self::Fault>)]
-    fn produce(&self, good: Self::Good) {
-        self.outputs.produce(good)?
-    }
-}
-
 /// A statement from the server.
-#[derive(Clone, Copy, Debug, ParseDisplay)]
+#[derive(Clone, Copy, Debug, parse_display::Display)]
 #[display(style = "CamelCase")]
 pub enum ServerStatement {
     /// The server exited.
@@ -200,18 +174,18 @@ pub enum ServerStatement {
 }
 
 /// A statement from the client.
-#[derive(Debug, ParseDisplay)]
+#[derive(Debug, parse_display::Display)]
 #[display("")]
 pub enum ClientStatement {
     /// The tool opened `doc`.
     OpenDoc {
         /// The document that was opened.
-        doc: TextDocumentItem,
+        doc: lsp_types::TextDocumentItem,
     },
     /// The tool closed `doc`.
     CloseDoc {
         /// The document that was closed.
-        doc: TextDocumentIdentifier,
+        doc: lsp_types::TextDocumentIdentifier,
     },
 }
 
@@ -219,14 +193,14 @@ impl ClientStatement {
     /// Creates a `didOpen` `ClientStatement`.
     #[inline]
     #[must_use]
-    pub const fn open_doc(doc: TextDocumentItem) -> Self {
+    pub const fn open_doc(doc: lsp_types::TextDocumentItem) -> Self {
         Self::OpenDoc { doc }
     }
 
     /// Creates a `didClose` `ClientStatement`.
     #[inline]
     #[must_use]
-    pub const fn close_doc(doc: TextDocumentIdentifier) -> Self {
+    pub const fn close_doc(doc: lsp_types::TextDocumentIdentifier) -> Self {
         Self::CloseDoc { doc }
     }
 
@@ -241,16 +215,12 @@ impl From<ClientStatement> for ClientMessage {
     #[inline]
     fn from(value: ClientStatement) -> Self {
         match value {
-            ClientStatement::OpenDoc { doc } => {
-                Self::Notification(ClientNotification::OpenDoc(DidOpenTextDocumentParams {
-                    text_document: doc,
-                }))
-            }
-            ClientStatement::CloseDoc { doc } => {
-                Self::Notification(ClientNotification::CloseDoc(DidCloseTextDocumentParams {
-                    text_document: doc,
-                }))
-            }
+            ClientStatement::OpenDoc { doc } => Self::Notification(ClientNotification::OpenDoc(
+                lsp_types::DidOpenTextDocumentParams { text_document: doc },
+            )),
+            ClientStatement::CloseDoc { doc } => Self::Notification(ClientNotification::CloseDoc(
+                lsp_types::DidCloseTextDocumentParams { text_document: doc },
+            )),
         }
     }
 }
@@ -263,15 +233,15 @@ pub struct ErrorMessage {
 }
 
 /// An error while composing an error message.
-#[derive(Clone, Copy, Debug, ThisError)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("Error while composing error message")]
 pub struct ErrorMessageCompositionError;
 
-impl AssembleFrom<u8> for ErrorMessage {
+impl conventus::AssembleFrom<u8> for ErrorMessage {
     type Error = ErrorMessageCompositionError;
 
     #[inline]
-    #[throws(AssembleFailure<Self::Error>)]
+    #[throws(conventus::AssembleFailure<Self::Error>)]
     fn assemble_from(parts: &mut Vec<u8>) -> Self {
         if let Ok(s) = std::str::from_utf8_mut(parts) {
             if let Some(index) = s.find('\n') {
@@ -283,7 +253,7 @@ impl AssembleFrom<u8> for ErrorMessage {
                 Self { line }
             } else {
                 // parts does not contain a new line.
-                throw!(AssembleFailure::Incomplete);
+                throw!(conventus::AssembleFailure::Incomplete);
             }
         } else {
             // parts has some invalid uft8.
@@ -301,11 +271,11 @@ impl Display for ErrorMessage {
 }
 
 /// An error during translation.
-#[derive(Debug, ThisError)]
+#[derive(Debug, thiserror::Error)]
 pub enum TranslationError {
     /// Failure while transmitting a client message.
     #[error(transparent)]
-    Transmission(#[from] ProduceFailure<WriteError<Message>>),
+    Transmission(#[from] market::ProduceFailure<market::io::WriteError<lsp::Message>>),
     /// Failure while receiving a server message.
     #[error(transparent)]
     Reception(#[from] ConsumeServerMessageError),
@@ -314,33 +284,30 @@ pub enum TranslationError {
     CreateClient(#[from] CreateClientError),
     /// Failure while waiting for process.
     #[error(transparent)]
-    Wait(#[from] WaitProcessError),
+    Wait(#[from] market::process::WaitFault),
     /// Failure while collecting outputs.
     #[error(transparent)]
-    CollectOutputs(#[from] ConsumeFailure<<PermanentQueue<ClientMessage> as Consumer>::Fault>),
+    CollectOutputs(#[from] market::channel::DisconnectedFault),
     /// Attempted to process an event in an invalid state.
     #[error("Invalid state: Cannot {0} while {1}")]
     InvalidState(Box<Event>, State),
     /// Failed to store output.
     #[error(transparent)]
-    Storage(#[from] ProduceFailure<Never>),
-    /// An error that will never occur.
-    #[error(transparent)]
-    Never(#[from] Never),
+    Storage(#[from] market::ProduceFailure<market::channel::DisconnectedFault>),
 }
 
 /// Describes events that the client must process.
-#[derive(Debug, ParseDisplay, PartialEq)]
+#[derive(Debug, parse_display::Display, PartialEq)]
 pub enum Event {
     /// The tool wants to send a message to the server.
     #[display("send message")]
     SendMessage(ClientMessage),
     /// THe server has completed initialization.
     #[display("process initialization")]
-    Initialized(InitializeResult),
+    Initialized(lsp_types::InitializeResult),
     /// The server has registered capabilities with the client.
     #[display("register capability")]
-    RegisterCapability(Id, RegistrationParams),
+    RegisterCapability(json_rpc::Id, lsp_types::RegistrationParams),
     /// The server has completed shutdown.
     #[display("complete shutdown")]
     CompletedShutdown,
@@ -350,13 +317,13 @@ pub enum Event {
 }
 
 /// Describes the state of the client.
-#[derive(Clone, Debug, ParseDisplay, PartialEq)]
+#[derive(Clone, Debug, parse_display::Display, PartialEq)]
 pub enum State {
     /// Server has not been initialized.
     #[display("uninitialized")]
     Uninitialized {
         /// The desired root directory of the server.
-        root_dir: Url,
+        root_dir: lsp_types::Url,
     },
     /// Waiting for the server to confirm initialization.
     #[display("waiting initialization")]
@@ -368,9 +335,9 @@ pub enum State {
     #[display("running")]
     Running {
         /// The state of the server.
-        server_state: Box<InitializeResult>,
+        server_state: Box<lsp_types::InitializeResult>,
         /// The registrations.
-        registrations: Vec<Registration>,
+        registrations: Vec<lsp_types::Registration>,
     },
     /// Waiting for the server to confirm shutdown.
     #[display("waiting shutdown")]
@@ -390,7 +357,7 @@ pub(crate) struct Translator {
 
 impl Translator {
     /// Creates a new `Translator`.
-    const fn new(client: Client, root_dir: Url) -> Self {
+    const fn new(client: Client, root_dir: lsp_types::Url) -> Self {
         Self {
             client,
             state: State::Uninitialized { root_dir },
@@ -411,28 +378,28 @@ impl Translator {
         match self.client.consume() {
             Ok(message) => {
                 match message {
-                    ServerMessage::Request { id, request } => match request {
-                        ServerRequest::RegisterCapability(registration) => {
+                    lsp::ServerMessage::Request { id, request } => match request {
+                        lsp::ServerRequest::RegisterCapability(registration) => {
                             self.process(Event::RegisterCapability(id, registration))?;
                         }
                     },
-                    ServerMessage::Response(response) => match response {
-                        ServerResponse::Initialize(initialize) => {
+                    lsp::ServerMessage::Response(response) => match response {
+                        lsp::ServerResponse::Initialize(initialize) => {
                             self.process(Event::Initialized(initialize))?;
                         }
-                        ServerResponse::Shutdown => {
+                        lsp::ServerResponse::Shutdown => {
                             self.process(Event::CompletedShutdown)?;
                         }
                     },
-                    ServerMessage::Notification(notification) => match notification {
-                        ServerNotification::PublishDiagnostics(_diagnostics) => {
+                    lsp::ServerMessage::Notification(notification) => match notification {
+                        lsp::ServerNotification::PublishDiagnostics(_diagnostics) => {
                             // TODO: Send diagnostics to tool.
                         }
                     },
                 }
             }
             Err(failure) => {
-                if let ConsumeFailure::Fault(fault) = failure {
+                if let market::ConsumeFailure::Fault(fault) = failure {
                     throw!(TranslationError::from(fault));
                 }
             }
@@ -580,7 +547,7 @@ impl Translator {
     }
 
     /// The client's `Waiter`.
-    const fn waiter(&self) -> &Waiter {
+    const fn waiter(&self) -> &market::process::Waiter<lsp::Message, lsp::Message, ErrorMessage> {
         self.client.waiter()
     }
 }
@@ -588,7 +555,7 @@ impl Translator {
 /// A client to a language server.
 pub(crate) struct Client {
     /// The server.
-    server: Process<Message, Message, ErrorMessage>,
+    server: market::process::Process<lsp::Message, lsp::Message, ErrorMessage>,
     /// The `Id` of the next request.
     next_id: Cell<u64>,
 }
@@ -598,25 +565,25 @@ impl Client {
     #[throws(CreateClientError)]
     fn new(command: Command) -> Self {
         Self {
-            server: Process::new(command)?,
+            server: market::process::Process::new(command)?,
             next_id: Cell::new(1),
         }
     }
 
     /// Sends an initialize request to the server.
     #[throws(TranslationError)]
-    fn initialize(&self, root_dir: &Url) {
+    fn initialize(&self, root_dir: &lsp_types::Url) {
         #[allow(deprecated)] // InitializeParams.root_path is required.
         self.produce(ClientMessage::Request(ClientRequest::Initialize(
-            InitializeParams {
+            lsp_types::InitializeParams {
                 process_id: Some(u64::from(process::id())),
                 root_path: None,
                 root_uri: Some(root_dir.clone()),
                 initialization_options: None,
-                capabilities: ClientCapabilities {
+                capabilities: lsp_types::ClientCapabilities {
                     workspace: None,
-                    text_document: Some(TextDocumentClientCapabilities {
-                        synchronization: Some(SynchronizationCapability {
+                    text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                        synchronization: Some(lsp_types::SynchronizationCapability {
                             dynamic_registration: None,
                             will_save: None,
                             will_save_wait_until: None,
@@ -654,56 +621,60 @@ impl Client {
     }
 
     /// The server's `Waiter`.
-    const fn waiter(&self) -> &Waiter {
+    const fn waiter(&self) -> &market::process::Waiter<lsp::Message, lsp::Message, ErrorMessage> {
         self.server.waiter()
     }
 
     /// The server's stderr.
-    const fn stderr(&self) -> &Reader<ErrorMessage> {
+    const fn stderr(&self) -> &Rc<market::io::Reader<ErrorMessage>> {
         self.server.stderr()
     }
 
     /// Returns the `Id` of the next request sent by `self`.
-    fn next_id(&self) -> Id {
+    fn next_id(&self) -> json_rpc::Id {
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
-        Id::Num(Number::from(id))
+        json_rpc::Id::Num(serde_json::Number::from(id))
     }
 }
 
-impl Consumer for Client {
-    type Good = ServerMessage;
-    type Fault = ConsumeServerMessageError;
+impl market::Consumer for Client {
+    type Good = lsp::ServerMessage;
+    type Failure = market::ConsumeFailure<ConsumeServerMessageError>;
 
-    #[throws(ConsumeFailure<Self::Fault>)]
+    #[throws(Self::Failure)]
     fn consume(&self) -> Self::Good {
         let good = self
             .server
             .consume()
-            .map_err(ConsumeFailure::map_into)?
+            .map_err(market::ConsumeFailure::map_from)?
             .try_into()
-            .map_err(|failure| ConsumeFailure::Fault(Self::Fault::from(failure)))?;
+            .map_err(|failure| {
+                market::ConsumeFailure::Fault(market::Fault::<Self::Failure>::from(failure))
+            })?;
         trace!("LSP Rx: {}", good);
         good
     }
 }
 
-impl Producer for Client {
+impl market::Producer for Client {
     type Good = ClientMessage;
-    type Fault = WriteError<Message>;
+    type Failure = market::ProduceFailure<market::io::WriteError<lsp::Message>>;
 
-    #[throws(ProduceFailure<Self::Fault>)]
+    #[throws(Self::Failure)]
     fn produce(&self, good: Self::Good) {
         trace!("LSP Tx: {}", good);
-        let message = Message::from(match good {
-            ClientMessage::Response { id, response } => Object::response(id, &response),
-            ClientMessage::Request(request) => Object::request(self.next_id(), &request),
-            ClientMessage::Notification(notification) => Object::notification(&notification),
+        let message = lsp::Message::from(match good {
+            ClientMessage::Response { id, response } => json_rpc::Object::response(id, &response),
+            ClientMessage::Request(request) => json_rpc::Object::request(self.next_id(), &request),
+            ClientMessage::Notification(notification) => {
+                json_rpc::Object::notification(&notification)
+            }
         });
 
         self.server
             .produce(message)
-            .map_err(ProduceFailure::map_into)?
+            .map_err(market::ProduceFailure::map_into)?
     }
 }
 
@@ -715,7 +686,7 @@ pub enum ClientMessage {
     /// A response.
     Response {
         /// The id of the matching request.
-        id: Id,
+        id: json_rpc::Id,
         /// The response.
         response: ClientResponse,
     },
@@ -740,16 +711,16 @@ impl Display for ClientMessage {
 }
 
 /// A request from the client.
-#[derive(Clone, Debug, ParseDisplay, PartialEq)]
+#[derive(Clone, Debug, parse_display::Display, PartialEq)]
 pub enum ClientRequest {
     /// The client is initializing the server.
     #[display("Initialize w/ {0:?}")]
-    Initialize(InitializeParams),
+    Initialize(lsp_types::InitializeParams),
     /// The client is shutting down the server.
     Shutdown,
 }
 
-impl Method for ClientRequest {
+impl json_rpc::Method for ClientRequest {
     fn method(&self) -> String {
         match *self {
             Self::Initialize(_) => "initialize",
@@ -758,22 +729,22 @@ impl Method for ClientRequest {
         .to_string()
     }
 
-    fn params(&self) -> Params {
+    fn params(&self) -> json_rpc::Params {
         match *self {
             Self::Initialize(ref params) => {
                 #[allow(clippy::expect_used)] // InitializeParams can be serialized to JSON.
-                Params::from(
+                json_rpc::Params::from(
                     serde_json::to_value(params)
                         .expect("Converting InitializeParams to JSON Value"),
                 )
             }
-            Self::Shutdown => Params::None,
+            Self::Shutdown => json_rpc::Params::None,
         }
     }
 }
 
 /// A notification from the client.
-#[derive(Clone, Debug, ParseDisplay, PartialEq)]
+#[derive(Clone, Debug, parse_display::Display, PartialEq)]
 pub enum ClientNotification {
     /// The client received the server's initialization response.
     Initialized,
@@ -781,13 +752,13 @@ pub enum ClientNotification {
     Exit,
     /// The client opened a document.
     #[display("OpenDoc w/ {0:?}")]
-    OpenDoc(DidOpenTextDocumentParams),
+    OpenDoc(lsp_types::DidOpenTextDocumentParams),
     /// The client closed a document.
     #[display("CloseDoc w/ {0:?}")]
-    CloseDoc(DidCloseTextDocumentParams),
+    CloseDoc(lsp_types::DidCloseTextDocumentParams),
 }
 
-impl Method for ClientNotification {
+impl json_rpc::Method for ClientNotification {
     fn method(&self) -> String {
         match *self {
             Self::Initialized => "initialized",
@@ -798,13 +769,13 @@ impl Method for ClientNotification {
         .to_string()
     }
 
-    fn params(&self) -> Params {
+    fn params(&self) -> json_rpc::Params {
         match *self {
-            Self::Initialized | Self::Exit => Params::None,
+            Self::Initialized | Self::Exit => json_rpc::Params::None,
             Self::OpenDoc(ref params) => {
                 #[allow(clippy::expect_used)]
                 // DidOpenTextDocumentParams can be serialized to JSON.
-                Params::from(
+                json_rpc::Params::from(
                     serde_json::to_value(params)
                         .expect("Converting DidOpenTextDocumentParams to JSON Value"),
                 )
@@ -812,7 +783,7 @@ impl Method for ClientNotification {
             Self::CloseDoc(ref params) => {
                 #[allow(clippy::expect_used)]
                 // DidCloseTextDocumentParams can be serialized to JSON.
-                Params::from(
+                json_rpc::Params::from(
                     serde_json::to_value(params)
                         .expect("Converting DidCloseTextDocumentParams to JSON Value"),
                 )
@@ -822,35 +793,35 @@ impl Method for ClientNotification {
 }
 
 /// A response from the client.
-#[derive(Clone, Copy, Debug, ParseDisplay, PartialEq)]
+#[derive(Clone, Copy, Debug, parse_display::Display, PartialEq)]
 pub enum ClientResponse {
     /// Confirms client registered capabilities.
     RegisterCapability,
 }
 
-impl Success for ClientResponse {
-    fn result(&self) -> Value {
+impl json_rpc::Success for ClientResponse {
+    fn result(&self) -> serde_json::Value {
         match *self {
-            Self::RegisterCapability => Value::Null,
+            Self::RegisterCapability => serde_json::Value::Null,
         }
     }
 }
 
 /// Failed to create `Client`.
-#[derive(Debug, ThisError)]
+#[derive(Debug, thiserror::Error)]
 pub enum CreateClientError {
     /// Failed to create server process.
     #[error(transparent)]
-    CreateProcess(#[from] CreateProcessError),
+    CreateProcess(#[from] market::process::CreateProcessError),
 }
 
-/// Client failed to consume `ServerMessage`.
-#[derive(Debug, ThisError)]
+/// Client failed to consume `lsp::ServerMessage`.
+#[derive(market::ConsumeFault, Debug, thiserror::Error)]
 pub enum ConsumeServerMessageError {
-    /// Client failed to consume Message from server.
+    /// Client failed to consume lsp::Message from server.
     #[error(transparent)]
-    Consume(#[from] ReadError<Message>),
-    /// Client failed to convert Message into ServerMessage.
+    Consume(#[from] market::io::ReadFault<lsp::Message>),
+    /// Client failed to convert lsp::Message into lsp::ServerMessage.
     #[error(transparent)]
-    UnknownServerMessage(#[from] UnknownServerMessageFailure),
+    UnknownServerMessage(#[from] lsp::UnknownServerMessageFailure),
 }
