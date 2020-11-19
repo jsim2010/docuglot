@@ -38,9 +38,9 @@ pub struct Tongue {
     /// Triggers the Tongue thread to join.
     joiner: market::sync::Trigger,
     /// Produces statements to be sent to the Translators.
-    transmission_channel: market::channel::Crossbeam<ClientStatement>,
+    transmission_channel: market::channel::Channel<market::channel::Crossbeam<ClientStatement>>,
     /// Consumes statements received from the Translators.
-    reception_channel: market::channel::Crossbeam<ServerStatement>,
+    reception_channel: market::channel::Channel<market::channel::Crossbeam<ServerStatement>>,
     /// The statuses of the Translators.
     status_consumer: market::channel::CrossbeamConsumer<ExitStatus>,
 }
@@ -53,10 +53,12 @@ impl Tongue {
         let dir = root_dir.clone();
         let mut lock = market::sync::Lock::new();
         let mut transmission_channel =
-            market::channel::Crossbeam::new(market::channel::Size::Infinite);
-        let mut reception_channel =
-            market::channel::Crossbeam::new(market::channel::Size::Infinite);
-        let mut status_channel = market::channel::Crossbeam::new(market::channel::Size::Infinite);
+            market::channel::Channel::new(market::channel::Size::Infinite);
+        let mut reception_channel = market::channel::Channel::new(market::channel::Size::Infinite);
+        let mut status_channel =
+            market::channel::Channel::<market::channel::Crossbeam<ExitStatus>>::new(
+                market::channel::Size::Infinite,
+            );
         let hammer = lock.hammer()?;
         let transmission_consumer = transmission_channel.consumer()?;
         let reception_producer = reception_channel.producer()?;
