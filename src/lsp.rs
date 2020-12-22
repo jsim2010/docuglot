@@ -3,6 +3,7 @@
 #![allow(clippy::wildcard_imports)] // cur is designed to use wildcard import.
 use {
     crate::json_rpc,
+    conventus::AssembleFrom,
     core::{
         convert::{TryFrom, TryInto},
         fmt::Display,
@@ -169,7 +170,7 @@ impl Message {
     }
 }
 
-impl conventus::AssembleFrom<u8> for Message {
+impl AssembleFrom<u8> for Message {
     type Error = AssembleMessageError;
 
     #[inline]

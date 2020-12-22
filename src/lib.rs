@@ -12,7 +12,17 @@ use {
     },
     fehler::{throw, throws},
     log::{error, trace},
-    market::{Consumer as _, Failure as _, Producer as _},
+    lsp::Message,
+    market::{
+        channel::{
+            create, Crossbeam, CrossbeamConsumer, CrossbeamProducer, Size, Structure, Style,
+            WithdrawnDemand, WithdrawnSupply,
+        },
+        io::{ReadFault, Reader, WriteFault},
+        process::Process,
+        sync::create_lock,
+        ConsumeFailure, ConsumeFault, Consumer, ProduceFailure, Producer,
+    },
     std::{
         process::{self, Command, ExitStatus},
         rc::Rc,
@@ -30,44 +40,32 @@ pub enum Language {
     Plaintext,
 }
 
-/// Manages all of the `Translator`s.
-#[derive(Debug)]
-pub struct Tongue {
-    /// The thread of Tongue.
-    thread: JoinHandle<()>,
-    /// Triggers the Tongue thread to join.
-    joiner: market::sync::Trigger,
-    /// Produces statements to be sent to the Translators.
-    transmission_channel: market::channel::Channel<market::channel::Crossbeam<ClientStatement>>,
-    /// Consumes statements received from the Translators.
-    reception_channel: market::channel::Channel<market::channel::Crossbeam<ServerStatement>>,
-    /// The statuses of the Translators.
-    status_consumer: market::channel::CrossbeamConsumer<ExitStatus>,
-}
+/// Initialize an instance of a [`Tongue`].
+#[must_use]
+#[inline]
+pub fn init(
+    root_dir: &lsp_types::Url,
+) -> (
+    CrossbeamProducer<ClientStatement>,
+    CrossbeamConsumer<ServerStatement>,
+    Tongue,
+) {
+    let dir = root_dir.clone();
+    let (trigger, hammer) = create_lock();
+    let (transmission_producer, transmission_consumer) =
+        create::<Crossbeam<ClientStatement>>(Structure::BilateralMonopoly, Size::Infinite);
+    let (reception_producer, reception_consumer) =
+        create::<Crossbeam<ServerStatement>>(Structure::BilateralMonopoly, Size::Infinite);
+    let (status_producer, status_consumer) =
+        create::<Crossbeam<ExitStatus>>(Structure::BilateralMonopoly, Size::Infinite);
 
-impl Tongue {
-    /// Creates a new `Tongue`.
-    #[inline]
-    #[throws(market::TakenParticipant)]
-    pub fn new(root_dir: &lsp_types::Url) -> Self {
-        let dir = root_dir.clone();
-        let mut lock = market::sync::Lock::new();
-        let mut transmission_channel =
-            market::channel::Channel::new(market::channel::Size::Infinite);
-        let mut reception_channel = market::channel::Channel::new(market::channel::Size::Infinite);
-        let mut status_channel =
-            market::channel::Channel::<market::channel::Crossbeam<ExitStatus>>::new(
-                market::channel::Size::Infinite,
-            );
-        let hammer = lock.hammer()?;
-        let transmission_consumer = transmission_channel.consumer()?;
-        let reception_producer = reception_channel.producer()?;
-        let status_producer = status_channel.producer()?;
-
-        Self {
-            joiner: lock.trigger()?,
+    (
+        transmission_producer,
+        reception_consumer,
+        Tongue {
+            joiner: trigger,
             thread: thread::spawn(move || {
-                if let Err(error) = Self::thread(
+                if let Err(error) = Tongue::thread(
                     &dir,
                     &hammer,
                     &transmission_consumer,
@@ -77,34 +75,31 @@ impl Tongue {
                     error!("tongue thread error: {}", error);
                 }
             }),
-            transmission_channel,
-            reception_channel,
-            status_consumer: status_channel.consumer()?,
-        }
-    }
+            status_consumer,
+        },
+    )
+}
 
-    /// Returns the consumer that consumes [`ServerStatement`]s.
-    #[inline]
-    #[throws(market::TakenParticipant)]
-    pub fn consumer(&mut self) -> market::channel::CrossbeamConsumer<ServerStatement> {
-        self.reception_channel.consumer()?
-    }
+/// Manages all of the `Translator`s.
+#[derive(Debug)]
+pub struct Tongue {
+    /// The thread of Tongue.
+    thread: JoinHandle<()>,
+    /// Triggers the Tongue thread to join.
+    joiner: market::sync::Trigger,
+    /// The statuses of the Translators.
+    status_consumer: <Crossbeam<ExitStatus> as Style>::Consumer,
+}
 
-    /// Returns the producer that produces [`ClientStatement`]s.
-    #[inline]
-    #[throws(market::TakenParticipant)]
-    pub fn producer(&mut self) -> market::channel::CrossbeamProducer<ClientStatement> {
-        self.transmission_channel.producer()?
-    }
-
+impl Tongue {
     /// The main thread of a Tongue.
     #[throws(TranslationError)]
     fn thread(
         root_dir: &lsp_types::Url,
         hammer: &market::sync::Hammer,
-        transmission_consumer: &market::channel::CrossbeamConsumer<ClientStatement>,
-        reception_producer: &market::channel::CrossbeamProducer<ServerStatement>,
-        status_producer: &market::channel::CrossbeamProducer<ExitStatus>,
+        transmission_consumer: &<Crossbeam<ClientStatement> as Style>::Consumer,
+        reception_producer: &<Crossbeam<ServerStatement> as Style>::Producer,
+        status_producer: &<Crossbeam<ExitStatus> as Style>::Producer,
     ) {
         let rust_translator = Rc::new(RefCell::new(Translator::new(
             Client::new(Command::new("rust-analyzer"))?,
@@ -150,15 +145,15 @@ impl Tongue {
         }
 
         for (_, translator) in translators {
-            status_producer.produce(translator.borrow().waiter().demand()?)?;
+            status_producer.produce(translator.borrow().server().demand()?)?;
         }
     }
 
     /// Joins the thread.
     #[inline]
-    #[throws(market::ProduceFailure<market::channel::DisconnectedFault>)]
     pub fn join(&self) {
-        self.joiner.produce(())?;
+        #[allow(clippy::unwrap_used)] // Trigger::produce() returns Result<_, Infallible>.
+        self.joiner.produce(()).unwrap();
 
         // TODO: This appears to cause an error currently.
         //for _ in 0..2 {
@@ -277,7 +272,7 @@ impl Display for ErrorMessage {
 pub enum TranslationError {
     /// Failure while transmitting a client message.
     #[error(transparent)]
-    Transmission(#[from] market::ProduceFailure<market::io::WriteError<lsp::Message>>),
+    Transmission(#[from] ProduceFailure<WriteFault<Message>>),
     /// Failure while receiving a server message.
     #[error(transparent)]
     Reception(#[from] ConsumeServerMessageError),
@@ -287,15 +282,15 @@ pub enum TranslationError {
     /// Failure while waiting for process.
     #[error(transparent)]
     Wait(#[from] market::process::WaitFault),
-    /// Failure while collecting outputs.
-    #[error(transparent)]
-    CollectOutputs(#[from] market::channel::DisconnectedFault),
     /// Attempted to process an event in an invalid state.
     #[error("Invalid state: Cannot {0} while {1}")]
     InvalidState(Box<Event>, State),
-    /// Failed to store output.
+    /// Attempted to consume on channel with no supply.
     #[error(transparent)]
-    Storage(#[from] market::ProduceFailure<market::channel::DisconnectedFault>),
+    NoSupply(#[from] WithdrawnSupply),
+    /// Attempted to produce on channel with dropped [`Consumer`].
+    #[error(transparent)]
+    NoDemand(#[from] ProduceFailure<WithdrawnDemand>),
 }
 
 /// Describes events that the client must process.
@@ -542,22 +537,22 @@ impl Translator {
         }
     }
 
+    /// Returns the server process.
+    const fn server(&self) -> &Process<Message, Message, ErrorMessage> {
+        self.client.server()
+    }
+
     /// Shuts down the client.
     #[throws(TranslationError)]
     fn shutdown(&mut self) {
         self.process(Event::Exit)?;
-    }
-
-    /// The client's `Waiter`.
-    const fn waiter(&self) -> &market::process::Waiter<lsp::Message, lsp::Message, ErrorMessage> {
-        self.client.waiter()
     }
 }
 
 /// A client to a language server.
 pub(crate) struct Client {
     /// The server.
-    server: market::process::Process<lsp::Message, lsp::Message, ErrorMessage>,
+    server: Process<Message, Message, ErrorMessage>,
     /// The `Id` of the next request.
     next_id: Cell<u64>,
 }
@@ -622,14 +617,14 @@ impl Client {
         )))?;
     }
 
-    /// The server's `Waiter`.
-    const fn waiter(&self) -> &market::process::Waiter<lsp::Message, lsp::Message, ErrorMessage> {
-        self.server.waiter()
+    /// Returns the server process.
+    const fn server(&self) -> &Process<Message, Message, ErrorMessage> {
+        &self.server
     }
 
     /// The server's stderr.
-    const fn stderr(&self) -> &Rc<market::io::Reader<ErrorMessage>> {
-        self.server.stderr()
+    const fn stderr(&self) -> &Reader<ErrorMessage> {
+        self.server.error()
     }
 
     /// Returns the `Id` of the next request sent by `self`.
@@ -640,28 +635,29 @@ impl Client {
     }
 }
 
-impl market::Consumer for Client {
+impl Consumer for Client {
     type Good = lsp::ServerMessage;
-    type Failure = market::ConsumeFailure<ConsumeServerMessageError>;
+    type Failure = ConsumeFailure<ConsumeServerMessageError>;
 
     #[throws(Self::Failure)]
     fn consume(&self) -> Self::Good {
         let good = self
             .server
+            .output()
             .consume()
-            .map_err(market::ConsumeFailure::map_from)?
+            .map_err(ConsumeFailure::map_fault)?
             .try_into()
-            .map_err(|failure| {
-                market::ConsumeFailure::Fault(market::Fault::<Self::Failure>::from(failure))
+            .map_err(|error| {
+                market::ConsumeFailure::Fault(ConsumeServerMessageError::from(error))
             })?;
         trace!("LSP Rx: {}", good);
         good
     }
 }
 
-impl market::Producer for Client {
+impl Producer for Client {
     type Good = ClientMessage;
-    type Failure = market::ProduceFailure<market::io::WriteError<lsp::Message>>;
+    type Failure = ProduceFailure<WriteFault<Message>>;
 
     #[throws(Self::Failure)]
     fn produce(&self, good: Self::Good) {
@@ -674,9 +670,7 @@ impl market::Producer for Client {
             }
         });
 
-        self.server
-            .produce(message)
-            .map_err(market::ProduceFailure::map_into)?
+        self.server.input().produce(message)?
     }
 }
 
@@ -818,11 +812,11 @@ pub enum CreateClientError {
 }
 
 /// Client failed to consume `lsp::ServerMessage`.
-#[derive(market::ConsumeFault, Debug, thiserror::Error)]
+#[derive(ConsumeFault, Debug, thiserror::Error)]
 pub enum ConsumeServerMessageError {
     /// Client failed to consume lsp::Message from server.
     #[error(transparent)]
-    Consume(#[from] market::io::ReadFault<lsp::Message>),
+    Consume(#[from] ReadFault<Message>),
     /// Client failed to convert lsp::Message into lsp::ServerMessage.
     #[error(transparent)]
     UnknownServerMessage(#[from] lsp::UnknownServerMessageFailure),
