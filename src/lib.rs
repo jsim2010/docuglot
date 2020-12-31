@@ -13,6 +13,7 @@ use {
     fehler::{throw, throws},
     log::{error, trace},
     lsp::Message,
+    lsp_types::TextDocumentSyncClientCapabilities,
     market::{
         channel::{
             create, Crossbeam, CrossbeamConsumer, CrossbeamProducer, Size, Structure, Style,
@@ -573,14 +574,14 @@ impl Client {
         #[allow(deprecated)] // InitializeParams.root_path is required.
         self.produce(ClientMessage::Request(ClientRequest::Initialize(
             lsp_types::InitializeParams {
-                process_id: Some(u64::from(process::id())),
+                process_id: Some(process::id()),
                 root_path: None,
                 root_uri: Some(root_dir.clone()),
                 initialization_options: None,
                 capabilities: lsp_types::ClientCapabilities {
                     workspace: None,
                     text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                        synchronization: Some(lsp_types::SynchronizationCapability {
+                        synchronization: Some(TextDocumentSyncClientCapabilities {
                             dynamic_registration: None,
                             will_save: None,
                             will_save_wait_until: None,
@@ -606,13 +607,20 @@ impl Client {
                         rename: None,
                         publish_diagnostics: None,
                         folding_range: None,
+                        selection_range: None,
+                        linked_editing_range: None,
+                        call_hierarchy: None,
+                        semantic_tokens: None,
+                        moniker: None,
                     }),
                     window: None,
+                    general: None,
                     experimental: None,
                 },
                 trace: None,
                 workspace_folders: None,
                 client_info: None,
+                locale: None,
             },
         )))?;
     }
