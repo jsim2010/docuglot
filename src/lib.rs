@@ -52,7 +52,7 @@ struct TongueThreadParams {
 /// - handle the initialization of the appropriate langugage server(s) when they are needed.
 /// - provide access to produce [`Transmission`]s by converting them into messages and sending them to the appropriate language server.
 ///
-/// Following the precedent set by [`Process`], [`Tongues`] shall impl [`Consumer`] of its status, while providing references to the input and output actors.
+/// Following the precedent set by [`market::process::Process`], [`Tongue`] shall impl [`Consumer`] of its status, while providing references to the input and output actors.
 ///
 /// "Tongue" refers to the ability of this item to be a tool that is used to communicate in multiple languages, just as a human tongue.
 // TODO: Implement a Consumer on the status of Tongue.
@@ -120,11 +120,13 @@ impl Tongue {
         {
             for good in params.transmission_consumer.goods() {
                 let transmission = good?;
-                transmission.language().map_or(&default_translator, |language| match language {
-                    Language::Rust => &rust_translator,
-                })
-                .borrow_mut()
-                .transmit(vec![transmission.into()])?;
+                transmission
+                    .language()
+                    .map_or(&default_translator, |language| match language {
+                        Language::Rust => &rust_translator,
+                    })
+                    .borrow_mut()
+                    .transmit(vec![transmission.into()])?;
             }
 
             for translator in &translators {
@@ -224,13 +226,11 @@ impl From<Transmission> for ClientMessage {
             Transmission::CloseDoc { doc } => {
                 Self::CloseDoc(DidCloseTextDocumentParams { text_document: doc })
             }
-            Transmission::GetDocumentSymbol { doc } => {
-                Self::DocumentSymbol(DocumentSymbolParams {
-                    text_document: doc,
-                    work_done_progress_params: WorkDoneProgressParams::default(),
-                    partial_result_params: PartialResultParams::default(),
-                })
-            }
+            Transmission::GetDocumentSymbol { doc } => Self::DocumentSymbol(DocumentSymbolParams {
+                text_document: doc,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            }),
             Transmission::Shutdown => Self::Shutdown,
         }
     }

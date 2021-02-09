@@ -3,7 +3,8 @@
 #![allow(clippy::wildcard_imports)] // cur is designed to use wildcard import.
 use {
     crate::json_rpc::{
-        self, Kind, ProcessResponseError, MethodHandlers, Object, InsertRequestError, Outcome, Params, Request, ResponseHandlers,
+        self, InsertRequestError, Kind, MethodHandlers, Object, Outcome, Params,
+        ProcessResponseError, Request, ResponseHandlers,
     },
     conventus::AssembleFrom,
     core::{
@@ -293,7 +294,7 @@ impl Tool {
         match &mut self.state {
             State::Uninitialized { ref root_dir } => {
                 self.lsp_server.input().produce(Message::from(Object::from(
-                    self.rpc_client.request(&initialize_params(root_dir))?
+                    self.rpc_client.request(&initialize_params(root_dir))?,
                 )))?;
                 self.state = State::WaitingInitialization { messages };
             }
@@ -396,30 +397,32 @@ impl Request<State, Event> for InitializeParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |mut state, value| Some(match &mut state {
-                State::Uninitialized { .. }
-                | State::Running { .. }
-                | State::WaitingShutdown
-                | State::WaitingExit => {
-                    Ok(Event::Error(TranslationError::InvalidState(state.clone())))
-                }
-                State::WaitingInitialization { messages } => {
-                    match serde_json::from_value::<InitializeResult>(value) {
-                        Ok(initialize_result) =>  {
-                            let mut m = messages.clone();
-                            m.push(ClientMessage::Initialized);
-
-                            *state = State::Running {
-                                server_state: Box::new(initialize_result),
-                                registrations: Vec::new(),
-                            };
-
-                            Ok(Event::SendMessages(m))
-                        }
-                        Err(error) => Err(error),
+            |mut state, value| {
+                Some(match &mut state {
+                    State::Uninitialized { .. }
+                    | State::Running { .. }
+                    | State::WaitingShutdown
+                    | State::WaitingExit => {
+                        Ok(Event::Error(TranslationError::InvalidState(state.clone())))
                     }
-                }
-            }),
+                    State::WaitingInitialization { messages } => {
+                        match serde_json::from_value::<InitializeResult>(value) {
+                            Ok(initialize_result) => {
+                                let mut m = messages.clone();
+                                m.push(ClientMessage::Initialized);
+
+                                *state = State::Running {
+                                    server_state: Box::new(initialize_result),
+                                    registrations: Vec::new(),
+                                };
+
+                                Ok(Event::SendMessages(m))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                })
+            },
             |_, _| None,
         ))
     }
@@ -435,9 +438,7 @@ impl Request<State, Event> for DocumentSymbolParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |_, value| Some(
-                serde_json::from_value(value).map(Event::DocumentSymbol)
-            ),
+            |_, value| Some(serde_json::from_value(value).map(Event::DocumentSymbol)),
             |_, _| None,
         ))
     }
@@ -456,18 +457,20 @@ impl Request<State, Event> for ShutdownParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |mut state, _| Some(match &mut state {
-                State::Uninitialized { .. }
-                | State::Running { .. }
-                | State::WaitingInitialization { .. }
-                | State::WaitingExit => {
-                    Ok(Event::Error(TranslationError::InvalidState(state.clone())))
-                }
-                State::WaitingShutdown => {
-                    *state = State::WaitingExit;
-                    Ok(Event::SendMessages(vec![ClientMessage::Exit]))
-                }
-            }),
+            |mut state, _| {
+                Some(match &mut state {
+                    State::Uninitialized { .. }
+                    | State::Running { .. }
+                    | State::WaitingInitialization { .. }
+                    | State::WaitingExit => {
+                        Ok(Event::Error(TranslationError::InvalidState(state.clone())))
+                    }
+                    State::WaitingShutdown => {
+                        *state = State::WaitingExit;
+                        Ok(Event::SendMessages(vec![ClientMessage::Exit]))
+                    }
+                })
+            },
             |_, _| None,
         ))
     }

@@ -1,6 +1,6 @@
 //! Defines JSON-RPC structures and processing.
 use {
-    core::fmt::{self, Formatter, Debug, Display},
+    core::fmt::{self, Debug, Display, Formatter},
     fehler::{throw, throws},
     serde::{Deserialize, Serialize},
     serde_json::{Map, Number, Value},
@@ -11,7 +11,7 @@ use {
 };
 
 /// The minimum value of a predefined error code.
-#[allow(clippy::decimal_literal_representation)] // Decimal version is used on specification.
+#[allow(clippy::decimal_literal_representation)] // Decimal version is used in specification.
 const PREDEFINED_ERROR_MIN_CODE: i64 = -32768;
 /// A code value indicating a parse error.
 const PARSE_ERROR_CODE: i64 = -32700;
@@ -220,7 +220,7 @@ impl From<Params> for Value {
 #[derive(Clone, Debug, Deserialize, Eq, parse_display::Display, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
-pub(crate)enum Id {
+pub(crate) enum Id {
     /// A null id.
     #[display("NULL")]
     Null,
@@ -371,12 +371,10 @@ impl<S, O> Client<S, O> {
         if let Some(handlers) = response_handlers {
             match response.outcome {
                 Outcome::Result(value) => (handlers.0)(state, value).transpose()?,
-                Outcome::Error(ref error_object) => {
-                    match Error::from(error_object.clone()) {
-                        Error::Application(error) => (handlers.1)(state, error),
-                        Error::Predefined(error) => throw!(error),
-                    }
-                }
+                Outcome::Error(ref error_object) => match Error::from(error_object.clone()) {
+                    Error::Application(error) => (handlers.1)(state, error),
+                    Error::Predefined(error) => throw!(error),
+                },
             }
         } else {
             log::warn!("Received response with unrecognized id '{}'", response.id);
@@ -407,7 +405,16 @@ pub struct InsertRequestError {
 
 impl Display for InsertRequestError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{} handler for `{}` already existed", if self.was_request { "request" } else { "notification"}, self.method)
+        write!(
+            f,
+            "{} handler for `{}` already existed",
+            if self.was_request {
+                "request"
+            } else {
+                "notification"
+            },
+            self.method
+        )
     }
 }
 
@@ -421,7 +428,10 @@ fn insert_request<S, O, R: Request<S, O>>(
     let (req, notification) = request.method_handlers();
 
     if let Some(request_handler) = req {
-        if request_handlers.insert(R::METHOD, request_handler).is_some() {
+        if request_handlers
+            .insert(R::METHOD, request_handler)
+            .is_some()
+        {
             throw!(InsertRequestError {
                 method: R::METHOD.to_string(),
                 was_request: true,
@@ -430,7 +440,10 @@ fn insert_request<S, O, R: Request<S, O>>(
     }
 
     if let Some(notification_handler) = notification {
-        if notification_handlers.insert(R::METHOD, notification_handler).is_some() {
+        if notification_handlers
+            .insert(R::METHOD, notification_handler)
+            .is_some()
+        {
             throw!(InsertRequestError {
                 method: R::METHOD.to_string(),
                 was_request: false,
