@@ -1,10 +1,13 @@
 //! Defines JSON-RPC structures and processing.
 use {
-    core::fmt::{self, Debug, Display},
-    serde::{Deserialize, Serialize},
-    serde_json::{Number, Value, Map},
-    std::{collections::hash_map::{HashMap, Entry}, sync::atomic::{Ordering, AtomicU64}},
+    core::fmt::{self, Formatter, Debug, Display},
     fehler::{throw, throws},
+    serde::{Deserialize, Serialize},
+    serde_json::{Map, Number, Value},
+    std::{
+        collections::hash_map::{Entry, HashMap},
+        sync::atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// The minimum value of a predefined error code.
@@ -31,7 +34,7 @@ const SERVER_ERROR_MAX_CODE: i64 = PREDEFINED_ERROR_MAX_CODE;
 const METHOD_NOT_FOUND_MESSAGE: &str = "Method not found";
 
 /// The handler that defines how a client processes a successful response.
-pub(crate) type ResultHandler<S, O> = fn(&mut S, Value) -> Option<O>;
+pub(crate) type ResultHandler<S, O> = fn(&mut S, Value) -> Option<Result<O, serde_json::Error>>;
 
 /// The handler that defines how a client processes an error response.
 pub(crate) type ErrorHandler<S, O> = fn(&mut S, ErrorObject) -> Option<O>;
@@ -161,7 +164,7 @@ pub(crate) struct RequestObject {
 }
 
 impl Display for RequestObject {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
@@ -214,12 +217,10 @@ impl From<Params> for Value {
 /// The identifier of a JSON-RPC Request.
 ///
 /// MUST contain a String, Number, or NULL value.
-#[derive(
-    Clone, Debug, Deserialize, Eq, parse_display::Display, PartialEq, Serialize,
-)]
+#[derive(Clone, Debug, Deserialize, Eq, parse_display::Display, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
-pub enum Id {
+pub(crate)enum Id {
     /// A null id.
     #[display("NULL")]
     Null,
@@ -270,11 +271,21 @@ impl Outcome {
         })
     }
 
+    /// Returns an invalid state error.
     pub(crate) fn invalid_state() -> Self {
         Self::Error(ErrorObject {
             code: -127,
             message: "Invalid state".to_string(),
             data: None,
+        })
+    }
+
+    /// Returns an invalid params error.
+    pub(crate) fn invalid_params(error: &serde_json::Error) -> Self {
+        Self::Error(ErrorObject {
+            code: INVALID_PARAMS_CODE,
+            message: "Invalid method parameter(s)".to_string(),
+            data: Some(Value::String(error.to_string())),
         })
     }
 }
@@ -344,8 +355,12 @@ impl<S, O> Client<S, O> {
     }
 
     /// Returns the call and parameter for handling `response`.
-    #[throws(Error)]
-    pub(crate) fn process_response(&mut self, state: &mut S, response: ResponseObject) -> Option<O> {
+    #[throws(ProcessResponseError)]
+    pub(crate) fn process_response(
+        &mut self,
+        state: &mut S,
+        response: ResponseObject,
+    ) -> Option<O> {
         let mut response_handlers = None;
         if let Id::Num(ref id) = response.id {
             if let Some(id_u64) = id.as_u64() {
@@ -355,14 +370,11 @@ impl<S, O> Client<S, O> {
 
         if let Some(handlers) = response_handlers {
             match response.outcome {
-                Outcome::Result(value) => (handlers.0)(state, value),
+                Outcome::Result(value) => (handlers.0)(state, value).transpose()?,
                 Outcome::Error(ref error_object) => {
-                    let error = Error::from(error_object.clone());
-
-                    if let Error::Application(app_error) = error {
-                        (handlers.1)(state, app_error)
-                    } else {
-                        throw!(error)
+                    match Error::from(error_object.clone()) {
+                        Error::Application(error) => (handlers.1)(state, error),
+                        Error::Predefined(error) => throw!(error),
                     }
                 }
             }
@@ -373,21 +385,56 @@ impl<S, O> Client<S, O> {
     }
 }
 
+/// An error was cuaght during response processing.
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessResponseError {
+    /// Predefined.
+    #[error(transparent)]
+    Predefined(#[from] PredefinedError),
+    /// Serialize.
+    #[error(transparent)]
+    Serialize(#[from] serde_json::Error),
+}
+
+/// An error was caught when inserting a request into the server list.
+#[derive(Debug, thiserror::Error)]
+pub struct InsertRequestError {
+    /// The method on which the error occurred.
+    method: String,
+    /// The error occurred on a request - otherwise it occurred on a notification.
+    was_request: bool,
+}
+
+impl Display for InsertRequestError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{} handler for `{}` already existed", if self.was_request { "request" } else { "notification"}, self.method)
+    }
+}
+
 /// Inserts `request` into the appropriate handler map.
-fn insert_request<S, O, R: Request<S, O>>(request_handlers: &mut HashMap<&'static str, RequestHandler<S>>, notification_handlers: &mut HashMap<&'static str, NotificationHandler<S>>, request: &R) {
+#[throws(InsertRequestError)]
+fn insert_request<S, O, R: Request<S, O>>(
+    request_handlers: &mut HashMap<&'static str, RequestHandler<S>>,
+    notification_handlers: &mut HashMap<&'static str, NotificationHandler<S>>,
+    request: &R,
+) {
     let (req, notification) = request.method_handlers();
 
     if let Some(request_handler) = req {
-        #[allow(unused_results)] // Do not need to do anything with the possible old value.
-        {
-            request_handlers.insert(R::METHOD, request_handler);
+        if request_handlers.insert(R::METHOD, request_handler).is_some() {
+            throw!(InsertRequestError {
+                method: R::METHOD.to_string(),
+                was_request: true,
+            });
         }
     }
 
     if let Some(notification_handler) = notification {
-        #[allow(unused_results)] // Do not need to do anything with the possible old value.
-        {
-            notification_handlers.insert(R::METHOD, notification_handler);
+        if notification_handlers.insert(R::METHOD, notification_handler).is_some() {
+            throw!(InsertRequestError {
+                method: R::METHOD.to_string(),
+                was_request: false,
+            });
         }
     }
 }
@@ -404,49 +451,55 @@ pub(crate) struct Server<S> {
 
 impl<S> Server<S> {
     /// Creates a new [`Server`] that processes `requests`.
+    #[throws(InsertRequestError)]
     pub(crate) fn new<O, R: Request<S, O>>(requests: Vec<R>) -> Self {
         let mut request_handlers = HashMap::new();
         let mut notification_handlers = HashMap::new();
 
         for request in requests {
-            insert_request(&mut request_handlers, &mut notification_handlers, &request);
+            insert_request(&mut request_handlers, &mut notification_handlers, &request)?;
         }
 
         Self {
-            request_handlers: HashMap::new(),
-            notification_handlers: HashMap::new(),
+            request_handlers,
+            notification_handlers,
         }
     }
 
     /// Calls the appropriate handler for `request`, returning an output of type `O` and [`ResponseObject`] when appropriate.
-    pub(crate) fn process_request(&mut self, state: &mut S, request: RequestObject) -> Option<ResponseObject> {
+    pub(crate) fn process_request(
+        &mut self,
+        state: &mut S,
+        request: RequestObject,
+    ) -> Option<ResponseObject> {
         if let Some(id) = request.id {
-            let outcome = if let Some(request_handler) = self.request_handlers.get(request.method.as_str()) {
-                (request_handler)(state, request.params)
-            } else {
-                log::warn!("Received request with unknown method: {}", request.method);
-                Outcome::unknown_request()
-            };
+            let outcome =
+                if let Some(request_handler) = self.request_handlers.get(request.method.as_str()) {
+                    (request_handler)(state, request.params)
+                } else {
+                    log::warn!("Received request with unknown method: {}", request.method);
+                    Outcome::unknown_request()
+                };
 
-            Some(ResponseObject {
-                id,
-                outcome,
-            })
+            Some(ResponseObject { id, outcome })
+        } else if let Some(notification_handler) =
+            self.notification_handlers.get(request.method.as_str())
+        {
+            (notification_handler)(state, request.params);
+            None
         } else {
-            if let Some(notification_handler) = self.notification_handlers.get(request.method.as_str()) {
-                (notification_handler)(state, request.params);
-                None
-            } else {
-                log::warn!("Received notification with unknown method: {}", request.method);
-                None
-            }
+            log::warn!(
+                "Received notification with unknown method: {}",
+                request.method
+            );
+            None
         }
     }
 }
 
 /// An error returned from JSON-RPC.
 #[derive(Debug, thiserror::Error, market::ConsumeFault)]
-pub enum Error {
+pub(crate) enum Error {
     /// An error predefined by the JSON-RPC specification.
     #[error(transparent)]
     Predefined(PredefinedError),
@@ -460,13 +513,19 @@ impl From<ErrorObject> for Error {
         match error.code {
             PREDEFINED_ERROR_MIN_CODE..=PREDEFINED_ERROR_MAX_CODE => match error.code {
                 PARSE_ERROR_CODE => Self::Predefined(PredefinedError::Parse(error.data)),
-                INVALID_REQUEST_CODE => Self::Predefined(PredefinedError::InvalidRequest(error.data)),
-                METHOD_NOT_FOUND_CODE => Self::Predefined(PredefinedError::MethodNotFound(error.data)),
+                INVALID_REQUEST_CODE => {
+                    Self::Predefined(PredefinedError::InvalidRequest(error.data))
+                }
+                METHOD_NOT_FOUND_CODE => {
+                    Self::Predefined(PredefinedError::MethodNotFound(error.data))
+                }
                 INVALID_PARAMS_CODE => Self::Predefined(PredefinedError::InvalidParams(error.data)),
                 INTERNAL_ERROR_CODE => Self::Predefined(PredefinedError::Internal(error.data)),
-                SERVER_ERROR_MIN_CODE..=SERVER_ERROR_MAX_CODE => Self::Predefined(PredefinedError::Server(error)),
+                SERVER_ERROR_MIN_CODE..=SERVER_ERROR_MAX_CODE => {
+                    Self::Predefined(PredefinedError::Server(error))
+                }
                 _ => Self::Predefined(PredefinedError::Reserved(error)),
-            }
+            },
             _ => Self::Application(error),
         }
     }

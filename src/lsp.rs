@@ -2,24 +2,28 @@
 // TODO: This should be moved to only occur on cur (functionality exists in master but not 1.46.0.
 #![allow(clippy::wildcard_imports)] // cur is designed to use wildcard import.
 use {
+    crate::json_rpc::{
+        self, Kind, ProcessResponseError, MethodHandlers, Object, InsertRequestError, Outcome, Params, Request, ResponseHandlers,
+    },
     conventus::AssembleFrom,
     core::{
         fmt::{self, Display},
         str::Utf8Error,
     },
-    fehler::{throws, throw},
-    crate::json_rpc::{self, Outcome, MethodHandlers, ResponseHandlers, Params, Request, Object, Kind},
+    fehler::{throw, throws},
+    lsp_types::{
+        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolClientCapabilities,
+        DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializeResult,
+        InitializedParams, RegistrationParams, TextDocumentSyncClientCapabilities, Url,
+    },
     market::{
-        Consumer, ConsumeFault, Producer, ProduceFailure,
-        channel::{WithdrawnDemand, WithdrawnSupply},
+        channel::{WithdrawnDemandFault, WithdrawnSupplyFault},
         io::{ReadFault, WriteFault},
         process::Process,
+        ConsumeFault, Consumer, Failure, ProduceFailure, Producer,
     },
     serde_json::Value,
-    lsp_types::{Url, InitializeParams, DocumentSymbolResponse, DocumentSymbolClientCapabilities, TextDocumentSyncClientCapabilities, InitializedParams, DocumentSymbolParams, DidOpenTextDocumentParams, DidCloseTextDocumentParams, InitializeResult, RegistrationParams},
-    std::{
-        process::{self, Command},
-    },
+    std::process::{self, Command},
 };
 
 use cur::*;
@@ -36,14 +40,75 @@ static HEADER_FIELD_DELIMITER: &str = "\r\n";
 game!(TCHAR = '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' |'`' | '|' | '~' | '0'..='9' | 'A'..='Z' | 'a'..='z');
 game!(MESSAGE = ([(name @ [TCHAR; 1..], HEADER_FIELD_NAME_DELIMITER, (value @ [_; ..]), HEADER_FIELD_DELIMITER); 1..], "\r\n", content @ [_; ..]));
 
+/// Returns an initialize params for the tool.
+fn initialize_params(root_dir: &Url) -> InitializeParams {
+    #[allow(deprecated)] // root_path is required by InitializeParams.
+    InitializeParams {
+        process_id: Some(process::id()),
+        root_path: None,
+        root_uri: Some(root_dir.clone()),
+        initialization_options: None,
+        capabilities: lsp_types::ClientCapabilities {
+            workspace: None,
+            text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                synchronization: Some(TextDocumentSyncClientCapabilities {
+                    dynamic_registration: None,
+                    will_save: None,
+                    will_save_wait_until: None,
+                    did_save: None,
+                }),
+                completion: None,
+                hover: None,
+                signature_help: None,
+                references: None,
+                document_highlight: None,
+                document_symbol: Some(DocumentSymbolClientCapabilities {
+                    dynamic_registration: None,
+                    symbol_kind: None,
+                    hierarchical_document_symbol_support: Some(true),
+                    tag_support: None,
+                }),
+                formatting: None,
+                range_formatting: None,
+                on_type_formatting: None,
+                declaration: None,
+                definition: None,
+                type_definition: None,
+                implementation: None,
+                code_action: None,
+                code_lens: None,
+                document_link: None,
+                color_provider: None,
+                rename: None,
+                publish_diagnostics: None,
+                folding_range: None,
+                selection_range: None,
+                linked_editing_range: None,
+                call_hierarchy: None,
+                semantic_tokens: None,
+                moniker: None,
+            }),
+            window: None,
+            general: None,
+            experimental: None,
+        },
+        trace: None,
+        workspace_folders: None,
+        client_info: None,
+        locale: None,
+    }
+}
+
 /// Describes events that the client must process.
 #[derive(Debug, parse_display::Display)]
-pub enum Event {
+pub(crate) enum Event {
     /// The tool wants to send a message to the server.
     #[display("send message")]
     SendMessages(Vec<ClientMessage>),
+    /// The tool encountered an error.
     #[display("error")]
     Error(TranslationError),
+    /// The tool received a document symbol.
     #[display("")]
     DocumentSymbol(DocumentSymbolResponse),
 }
@@ -65,72 +130,39 @@ pub enum TranslationError {
     Wait(#[from] market::process::WaitFault),
     /// Attempted to consume on channel with no supply.
     #[error(transparent)]
-    NoSupply(#[from] WithdrawnSupply),
+    NoSupply(#[from] WithdrawnSupplyFault),
     /// Attempted to produce on channel with dropped [`Consumer`].
     #[error(transparent)]
-    NoDemand(#[from] ProduceFailure<WithdrawnDemand>),
+    NoDemand(#[from] ProduceFailure<WithdrawnDemandFault>),
+    /// An error serializing a message.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
+    /// An error reading the message.
     #[error(transparent)]
     Read(#[from] ReadFault<Message>),
+    /// A JSON-RPC error.
     #[error(transparent)]
-    Json(#[from]json_rpc::Error),
-    #[error("Invalid state")]
+    ProcessResponse(#[from] ProcessResponseError),
+    /// An invalid state.
+    #[error("LSP client in invalid state: {0}")]
     InvalidState(State),
 }
 
 /// A message to the language server.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ClientMessage {
-    Initialized,
-    Shutdown,
-    Exit,
-    /// A request.
-    Request(ClientRequest),
-    /// A notification.
-    Notification(ClientNotification),
-}
-
-impl Display for ClientMessage {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match *self {
-                Self::Initialized => "".to_string(),
-                Self::Shutdown => "".to_string(),
-                Self::Exit => "".to_string(),
-                Self::Request(ref request) => format!("{}: {}", "Request", request),
-                Self::Notification(ref notification) =>
-                    format!("{}: {}", "Notification", notification),
-            }
-        )
-    }
-}
-
-impl From<ClientRequest> for ClientMessage {
-    fn from(request: ClientRequest) -> Self {
-        Self::Request(request)
-    }
-}
-
-impl From<ClientNotification> for ClientMessage {
-    fn from(notification: ClientNotification) -> Self {
-        Self::Notification(notification)
-    }
-}
-
-/// A request from the client.
 #[derive(Clone, Debug, parse_display::Display, PartialEq)]
-pub enum ClientRequest {
+pub enum ClientMessage {
+    /// The client received the initialization.
+    #[display("Initialized")]
+    Initialized,
+    /// The client is shutting down.
+    #[display("Shutdown")]
+    Shutdown,
+    /// The client is exiting.
+    #[display("Exit")]
+    Exit,
+    /// The client requests a document symbol.
     #[display("DocumentSymbol {0:?}")]
     DocumentSymbol(DocumentSymbolParams),
-}
-
-/// A notification from the client.
-#[derive(Clone, Debug, parse_display::Display, PartialEq)]
-pub enum ClientNotification {
     /// The client opened a document.
     #[display("OpenDoc w/ {0:?}")]
     OpenDoc(DidOpenTextDocumentParams),
@@ -141,17 +173,17 @@ pub enum ClientNotification {
 
 /// An error message.
 #[derive(Clone, Debug)]
-pub struct ErrorMessage {
+pub(crate) struct ErrorMessage {
     /// The message.
     line: String,
 }
 
 /// An error while composing an error message.
-#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[derive(Clone, Copy, ConsumeFault, Debug, thiserror::Error)]
 #[error("Error while composing error message")]
-pub struct ErrorMessageCompositionError;
+pub(crate) struct ErrorMessageCompositionError;
 
-impl conventus::AssembleFrom<u8> for ErrorMessage {
+impl AssembleFrom<u8> for ErrorMessage {
     type Error = ErrorMessageCompositionError;
 
     #[inline]
@@ -215,10 +247,15 @@ pub enum State {
     WaitingExit,
 }
 
+/// The LSP client.
 pub(crate) struct Tool {
+    /// The LSP server process.
     lsp_server: Process<Message, Message, ErrorMessage>,
+    /// The JSON-RPC client.
     rpc_client: json_rpc::Client<State, Event>,
+    /// The JSON-RPC server.
     rpc_server: json_rpc::Server<State>,
+    /// Defines the current state of `Self`.
     state: State,
 }
 
@@ -230,139 +267,96 @@ impl Tool {
             lsp_server: market::process::Process::new(command)?,
             state: State::Uninitialized { root_dir },
             rpc_client: json_rpc::Client::new(),
-            rpc_server: json_rpc::Server::new(vec![RegistrationParams {registrations: vec![]}]),
+            rpc_server: json_rpc::Server::new(vec![RegistrationParams {
+                registrations: vec![],
+            }])?,
         }
     }
 
+    /// Creates a new [`Tool`] that is already waiting to exit.
     #[throws(CreateClientError)]
     pub(crate) fn new_finished(command: Command) -> Self {
         Self {
             lsp_server: market::process::Process::new(command)?,
             state: State::WaitingExit,
             rpc_client: json_rpc::Client::new(),
-            rpc_server: json_rpc::Server::new(vec![RegistrationParams {registrations: vec![]}]),
+            rpc_server: json_rpc::Server::new(vec![RegistrationParams {
+                registrations: vec![],
+            }])?,
         }
     }
 
+    /// Transmits `messages` to the LSP server.
     #[throws(TranslationError)]
     pub(crate) fn transmit(&mut self, mut messages: Vec<ClientMessage>) {
+        log::trace!("transmit {:?}", messages);
         match &mut self.state {
             State::Uninitialized { ref root_dir } => {
-                #[allow(deprecated)] // root_path is required by InitializeParams.
-                self.lsp_server.input().produce(Message::from(
-                    Object::from(self.rpc_client.request(
-                    &InitializeParams {
-                        process_id: Some(process::id()),
-                        root_path: None,
-                        root_uri: Some(root_dir.clone()),
-                        initialization_options: None,
-                        capabilities: lsp_types::ClientCapabilities {
-                            workspace: None,
-                            text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                                synchronization: Some(TextDocumentSyncClientCapabilities {
-                                    dynamic_registration: None,
-                                    will_save: None,
-                                    will_save_wait_until: None,
-                                    did_save: None,
-                                }),
-                                completion: None,
-                                hover: None,
-                                signature_help: None,
-                                references: None,
-                                document_highlight: None,
-                                document_symbol: Some(DocumentSymbolClientCapabilities {
-                                    dynamic_registration: None,
-                                    symbol_kind: None,
-                                    hierarchical_document_symbol_support: Some(true),
-                                    tag_support: None,
-                                }),
-                                formatting: None,
-                                range_formatting: None,
-                                on_type_formatting: None,
-                                declaration: None,
-                                definition: None,
-                                type_definition: None,
-                                implementation: None,
-                                code_action: None,
-                                code_lens: None,
-                                document_link: None,
-                                color_provider: None,
-                                rename: None,
-                                publish_diagnostics: None,
-                                folding_range: None,
-                                selection_range: None,
-                                linked_editing_range: None,
-                                call_hierarchy: None,
-                                semantic_tokens: None,
-                                moniker: None,
-                            }),
-                            window: None,
-                            general: None,
-                            experimental: None,
-                        },
-                        trace: None,
-                        workspace_folders: None,
-                        client_info: None,
-                        locale: None,
-                    }
-                )?)))?;
-                self.state = State::WaitingInitialization {
-                    messages,
-                };
+                self.lsp_server.input().produce(Message::from(Object::from(
+                    self.rpc_client.request(&initialize_params(root_dir))?
+                )))?;
+                self.state = State::WaitingInitialization { messages };
             }
-            State::WaitingInitialization { messages: pending_messages } => {
+            State::WaitingInitialization {
+                messages: pending_messages,
+            } => {
                 pending_messages.append(&mut messages);
             }
             State::Running { .. } => {
                 for message in messages {
-                    self.lsp_server.input().produce(Message::from(match message {
-                        ClientMessage::Initialized => {
-                            Object::from(self.rpc_client.request(&InitializedParams{})?)
-                        }
-                        ClientMessage::Shutdown => {
-                            Object::from(self.rpc_client.request(&ShutdownParams)?)
-                        }
-                        ClientMessage::Exit => {
-                            Object::from(self.rpc_client.request(&ExitParams{})?)
-                        }
-                        ClientMessage::Request(request) => {
-                            match request {
-                                ClientRequest::DocumentSymbol(params) => Object::from(self.rpc_client.request(&params)?),
+                    self.lsp_server
+                        .input()
+                        .produce(Message::from(match message {
+                            ClientMessage::Initialized => {
+                                Object::from(self.rpc_client.request(&InitializedParams {})?)
                             }
-                        }
-                        ClientMessage::Notification(notification) => {
-                            match notification {
-                                ClientNotification::OpenDoc(params) => Object::from(self.rpc_client.request(&params)?),
-                                ClientNotification::CloseDoc(params) => Object::from(self.rpc_client.request(&params)?),
+                            ClientMessage::Shutdown => {
+                                Object::from(self.rpc_client.request(&ShutdownParams)?)
                             }
-                        }
-                    }))?;
+                            ClientMessage::Exit => {
+                                Object::from(self.rpc_client.request(&ExitParams {})?)
+                            }
+                            ClientMessage::DocumentSymbol(params) => {
+                                Object::from(self.rpc_client.request(&params)?)
+                            }
+                            ClientMessage::OpenDoc(params) => {
+                                Object::from(self.rpc_client.request(&params)?)
+                            }
+                            ClientMessage::CloseDoc(params) => {
+                                Object::from(self.rpc_client.request(&params)?)
+                            }
+                        }))?;
                 }
             }
             State::WaitingShutdown | State::WaitingExit => {
-                throw!(TranslationError::InvalidState(
-                    self.state.clone()
-                ));
+                throw!(TranslationError::InvalidState(self.state.clone()));
             }
         }
+        log::trace!("end transmit");
     }
 
+    /// Processes all receptions from LSP server.
     #[throws(TranslationError)]
     pub(crate) fn process_receptions(&mut self) -> Vec<Event> {
         let mut receptions = Vec::new();
 
-        for message in self.lsp_server.output().consume_iter()? {
-            if let Some(reception) = match message.into() {
+        for good in self.lsp_server.output().goods() {
+            if let Some(reception) = match good?.into() {
                 Kind::Request(request_object) => {
-                    if let Some(response) = self.rpc_server.process_request(&mut self.state, request_object) {
-                        self.lsp_server.input().produce(Message::from(Object::from(response)))?;
+                    if let Some(response) = self
+                        .rpc_server
+                        .process_request(&mut self.state, request_object)
+                    {
+                        self.lsp_server
+                            .input()
+                            .produce(Message::from(Object::from(response)))?;
                     }
 
                     None
                 }
-                Kind::Response(response) => {
-                    self.rpc_client.process_response(&mut self.state, response)?
-                }
+                Kind::Response(response) => self
+                    .rpc_client
+                    .process_response(&mut self.state, response)?,
             } {
                 receptions.push(reception);
             }
@@ -373,14 +367,10 @@ impl Tool {
 
     /// Logs all messages that have currently been received on stderr.
     pub(crate) fn log_errors(&self) {
-        match self.lsp_server.error().consume_all() {
-            Ok(messages) => {
-                for message in messages {
-                    log::error!("lsp stderr: {}", message);
-                }
-            }
-            Err(error) => {
-                log::error!("error logger: {}", error);
+        for good in self.lsp_server.error().goods() {
+            match good {
+                Ok(message) => log::error!("lsp stderr: {}", message),
+                Err(error) => log::error!("error logger: {}", error),
             }
         }
     }
@@ -390,6 +380,7 @@ impl Tool {
         &self.lsp_server
     }
 
+    /// If state of `self` is waiting exit.
     pub(crate) fn is_waiting_exit(&self) -> bool {
         self.state == State::WaitingExit
     }
@@ -405,24 +396,30 @@ impl Request<State, Event> for InitializeParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |mut state, value| {
-                match &mut state {
-                    State::Uninitialized {..} | State::Running {..} | State::WaitingShutdown | State::WaitingExit => {
-                        Some(Event::Error(TranslationError::InvalidState(state.clone())))
-                    }
-                    State::WaitingInitialization { messages } => {
-                        let mut m = messages.clone();
-                        m.push(ClientMessage::Initialized);
+            |mut state, value| Some(match &mut state {
+                State::Uninitialized { .. }
+                | State::Running { .. }
+                | State::WaitingShutdown
+                | State::WaitingExit => {
+                    Ok(Event::Error(TranslationError::InvalidState(state.clone())))
+                }
+                State::WaitingInitialization { messages } => {
+                    match serde_json::from_value::<InitializeResult>(value) {
+                        Ok(initialize_result) =>  {
+                            let mut m = messages.clone();
+                            m.push(ClientMessage::Initialized);
 
-                        *state = State::Running {
-                            server_state: Box::new(serde_json::from_value::<InitializeResult>(value).unwrap()),
-                            registrations: Vec::new(),
-                        };
+                            *state = State::Running {
+                                server_state: Box::new(initialize_result),
+                                registrations: Vec::new(),
+                            };
 
-                        Some(Event::SendMessages(m))
+                            Ok(Event::SendMessages(m))
+                        }
+                        Err(error) => Err(error),
                     }
                 }
-            },
+            }),
             |_, _| None,
         ))
     }
@@ -438,14 +435,15 @@ impl Request<State, Event> for DocumentSymbolParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |_, value| {
-                Some(Event::DocumentSymbol(serde_json::from_value(value).unwrap()))
-            },
+            |_, value| Some(
+                serde_json::from_value(value).map(Event::DocumentSymbol)
+            ),
             |_, _| None,
         ))
     }
 }
 
+/// Params of "shutdown" method.
 struct ShutdownParams;
 
 impl Request<State, Event> for ShutdownParams {
@@ -458,17 +456,18 @@ impl Request<State, Event> for ShutdownParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |mut state, _| {
-                match &mut state {
-                    State::Uninitialized {..} | State::Running {..} | State::WaitingInitialization {..} | State::WaitingExit => {
-                        Some(Event::Error(TranslationError::InvalidState(state.clone())))
-                    }
-                    State::WaitingShutdown => {
-                        *state = State::WaitingExit;
-                        Some(Event::SendMessages(vec![ClientMessage::Exit]))
-                    }
+            |mut state, _| Some(match &mut state {
+                State::Uninitialized { .. }
+                | State::Running { .. }
+                | State::WaitingInitialization { .. }
+                | State::WaitingExit => {
+                    Ok(Event::Error(TranslationError::InvalidState(state.clone())))
                 }
-            },
+                State::WaitingShutdown => {
+                    *state = State::WaitingExit;
+                    Ok(Event::SendMessages(vec![ClientMessage::Exit]))
+                }
+            }),
             |_, _| None,
         ))
     }
@@ -501,6 +500,7 @@ impl Request<State, Event> for DidCloseTextDocumentParams {
     }
 }
 
+/// Params of "exit" method.
 struct ExitParams;
 
 impl Request<State, Event> for ExitParams {
@@ -526,18 +526,21 @@ impl Request<State, Event> for RegistrationParams {
 
     fn method_handlers(&self) -> MethodHandlers<State> {
         (
-            Some(|mut state, params| {
-                match &mut state {
-                    State::Running { registrations, .. } => {
-                        let mut register: RegistrationParams = serde_json::from_value(params.into()).unwrap();
-                        registrations.append(&mut register.registrations);
-                        Outcome::Result(Value::Null)
-                    }
-                    State::Uninitialized { .. } | State::WaitingInitialization { .. } | State::WaitingExit | State::WaitingShutdown => {
-                        Outcome::invalid_state()
+            Some(|mut state, params| match &mut state {
+                State::Running { registrations, .. } => {
+                    match serde_json::from_value::<Self>(params.into()) {
+                        Ok(mut register) => {
+                            registrations.append(&mut register.registrations);
+                            Outcome::Result(Value::Null)
+                        }
+                        Err(error) => Outcome::invalid_params(&error),
                     }
                 }
-            }), 
+                State::Uninitialized { .. }
+                | State::WaitingInitialization { .. }
+                | State::WaitingExit
+                | State::WaitingShutdown => Outcome::invalid_state(),
+            }),
             None,
         )
     }
@@ -548,7 +551,7 @@ impl Request<State, Event> for RegistrationParams {
 #[derive(Debug)]
 pub struct Message {
     /// The JSON-RPC object of the message.
-    content: json_rpc::Object,
+    content: Object,
 }
 
 impl Message {
@@ -590,7 +593,7 @@ impl AssembleFrom<u8> for Message {
         }
 
         // Cannot return from function until after parts.drain() is called.
-        let object: Result<json_rpc::Object, _> = match content_length {
+        let object: Result<Object, _> = match content_length {
             None => {
                 length = header_len;
                 Err(conventus::AssembleFailure::Error(
@@ -641,16 +644,29 @@ impl From<Message> for Kind {
     }
 }
 
-impl From<json_rpc::Object> for Message {
+impl From<Object> for Message {
     #[inline]
-    fn from(value: json_rpc::Object) -> Self {
+    fn from(value: Object) -> Self {
         Self { content: value }
     }
 }
 
+// Used to be able to implement Failure on DisassembleFrom<Message>::Error.
+/// Error disassembling message.
+#[derive(Debug, thiserror::Error)]
+pub enum DisassembleMessageFault {
+    /// Error serializing message.
+    #[error(transparent)]
+    Serialize(#[from] serde_json::Error),
+}
+
+impl Failure for DisassembleMessageFault {
+    type Fault = Self;
+}
+
 #[allow(clippy::use_self)] // False positive on format!.
 impl conventus::DisassembleFrom<Message> for u8 {
-    type Error = serde_json::Error;
+    type Error = DisassembleMessageFault;
 
     #[inline]
     #[throws(Self::Error)]
@@ -671,7 +687,7 @@ impl conventus::DisassembleFrom<Message> for u8 {
 }
 
 /// Error while assembling a `Message`.
-#[derive(Debug, thiserror::Error)]
+#[derive(ConsumeFault, Debug, thiserror::Error)]
 pub enum AssembleMessageError {
     /// Received bytes were not valid utf8.
     #[error(transparent)]
@@ -693,6 +709,9 @@ pub enum CreateClientError {
     /// Failed to create server process.
     #[error(transparent)]
     CreateProcess(#[from] market::process::CreateProcessError),
+    /// Failed to insert request.
+    #[error(transparent)]
+    InsertRequest(#[from] InsertRequestError),
 }
 
 /// Client failed to consume `lsp::ServerMessage`.

@@ -3,17 +3,19 @@
 mod json_rpc;
 mod lsp;
 
+pub use lsp::TranslationError;
+
 use {
-    core::{
-        cell::RefCell,
-    },
+    core::cell::RefCell,
     fehler::{throw, throws},
-    lsp::{TranslationError, Tool, Event, ClientRequest, ClientMessage, ClientNotification},
-    lsp_types::{Url, DocumentSymbolResponse, TextDocumentIdentifier, DidOpenTextDocumentParams, DidCloseTextDocumentParams, DocumentSymbolParams, WorkDoneProgressParams, PartialResultParams},
+    lsp::{ClientMessage, Event, Tool},
+    lsp_types::{
+        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
+        DocumentSymbolResponse, PartialResultParams, TextDocumentIdentifier, Url,
+        WorkDoneProgressParams,
+    },
     market::{
-        channel::{
-            create, Crossbeam, CrossbeamConsumer, CrossbeamProducer, Size, Structure,
-        },
+        channel::{create, Crossbeam, CrossbeamConsumer, CrossbeamProducer, Size},
         thread::{self, Thread},
         Consumer, Producer,
     },
@@ -32,10 +34,15 @@ pub enum Language {
     Rust,
 }
 
+/// Params passed to the thread in [`Tongue`].
 struct TongueThreadParams {
+    /// The root directory.
     root_dir: Url,
+    /// Consumes [`Transmission`]s.
     transmission_consumer: CrossbeamConsumer<Transmission>,
+    /// Produces [`Reception`]s.
     reception_producer: CrossbeamProducer<Reception>,
+    /// Produces thread status.
     status_producer: CrossbeamProducer<ExitStatus>,
 }
 
@@ -63,13 +70,17 @@ pub struct Tongue {
 
 impl Tongue {
     /// Creates a new [`Tongue`].
+    #[inline]
+    #[must_use]
     pub fn new(root_dir: &Url) -> Self {
-        let (transmitter, transmission_consumer) =
-            create::<Crossbeam<Transmission>>(Structure::BilateralMonopoly, Size::Infinite);
+        let (transmitter, transmission_consumer) = create::<Crossbeam<Transmission>>(
+            "Tongue Transmission Channel".to_string(),
+            Size::Infinite,
+        );
         let (reception_producer, receiver) =
-            create::<Crossbeam<Reception>>(Structure::BilateralMonopoly, Size::Infinite);
+            create::<Crossbeam<Reception>>("Tongue Reception Channel".to_string(), Size::Infinite);
         let (status_producer, status_consumer) =
-            create::<Crossbeam<ExitStatus>>(Structure::BilateralMonopoly, Size::Infinite);
+            create::<Crossbeam<ExitStatus>>("Tongue Status Channel".to_string(), Size::Infinite);
         let params = TongueThreadParams {
             root_dir: root_dir.clone(),
             transmission_consumer,
@@ -78,7 +89,12 @@ impl Tongue {
         };
 
         Self {
-            thread: Thread::new(thread::Kind::Single, params, Self::thread),
+            thread: Thread::new(
+                "docuglot tongue".to_string(),
+                thread::Kind::Single,
+                params,
+                Self::thread_fn,
+            ),
             status_consumer,
             transmitter,
             receiver,
@@ -87,42 +103,37 @@ impl Tongue {
 
     /// The main thread of a Tongue.
     #[throws(TranslationError)]
-    fn thread(params: &mut TongueThreadParams) {
+    fn thread_fn(params: &mut TongueThreadParams) {
         // TODO: Currently default_translator is a hack to deal with all files that do not have a known language. Ideally, this would run its own language server.
-        let default_translator = Rc::new(RefCell::new(Tool::new(
-            Command::new("echo"),
+        let default_translator = Rc::new(RefCell::new(Tool::new_finished(Command::new("echo"))?));
+        // Currently must use a hack in order to store non-Copy Tool as value in enum_map. See https://gitlab.com/KonradBorowski/enum-map/-/issues/15.
+        let rust_translator = Rc::new(RefCell::new(Tool::new(
+            Command::new("rust-analyzer"),
             params.root_dir.clone(),
         )?));
-        // Currently must use a hack in order to store non-Copy Tool as value in enum_map. See https://gitlab.com/KonradBorowski/enum-map/-/issues/15.
-        let rust_translator = Rc::new(RefCell::new(Tool::new_finished(
-            Command::new("rust-analyzer"),
-        )?));
-        let translators = [
-            Rc::clone(&rust_translator),
-            Rc::clone(&default_translator),
-        ];
+        let translators = [Rc::clone(&rust_translator), Rc::clone(&default_translator)];
 
         while !translators
             .iter()
             .map(|t| t.borrow().is_waiting_exit())
             .all(|x| x)
         {
-            for transmission in params.transmission_consumer.consume_iter()? {
-                if let Some(language) = transmission.language() {
-                    match language {
-                        Language::Rust => &rust_translator,
-                    }
-                } else {
-                    &default_translator
-                }.borrow_mut().transmit(vec![transmission.into()])?;
+            for good in params.transmission_consumer.goods() {
+                let transmission = good?;
+                transmission.language().map_or(&default_translator, |language| match language {
+                    Language::Rust => &rust_translator,
+                })
+                .borrow_mut()
+                .transmit(vec![transmission.into()])?;
             }
 
-            for translator in translators.iter() {
+            for translator in &translators {
                 let mut receptions = Vec::new();
+                let mut t = translator.borrow_mut();
 
-                for event in translator.borrow_mut().process_receptions()? {
+                for event in t.process_receptions()? {
                     match event {
-                        Event::SendMessages(messages) => translator.borrow_mut().transmit(messages)?,
+                        Event::SendMessages(messages) => t.transmit(messages)?,
                         Event::Error(error) => throw!(error),
                         Event::DocumentSymbol(document_symbol) => {
                             receptions.push(Reception::DocumentSymbols(document_symbol));
@@ -131,22 +142,36 @@ impl Tongue {
                 }
 
                 params.reception_producer.produce_all(receptions)?;
-                translator.borrow().log_errors();
+                t.log_errors();
             }
         }
 
-        for translator in translators.iter() {
-            params.status_producer.produce(translator.borrow().server().demand()?)?;
+        for translator in &translators {
+            params
+                .status_producer
+                .produce(translator.borrow().server().demand()?)?;
         }
     }
 
+    /// Returns a reference to the thead.
+    // TODO: Possibly should move this to Consumer impl of Tongue.
+    #[inline]
+    #[must_use]
+    pub const fn thread(&self) -> &Thread<(), TranslationError> {
+        &self.thread
+    }
+
     /// Returns a reference to the [`Transmission`] [`Producer`].
-    pub fn transmitter(&self) -> &CrossbeamProducer<Transmission> {
+    #[inline]
+    #[must_use]
+    pub const fn transmitter(&self) -> &CrossbeamProducer<Transmission> {
         &self.transmitter
     }
 
     /// Returns a reference to the [`Reception`] [`Consumer`].
-    pub fn receiver(&self) -> &CrossbeamConsumer<Reception> {
+    #[inline]
+    #[must_use]
+    pub const fn receiver(&self) -> &CrossbeamConsumer<Reception> {
         &self.receiver
     }
 }
@@ -193,10 +218,20 @@ impl From<Transmission> for ClientMessage {
     #[inline]
     fn from(transmission: Transmission) -> Self {
         match transmission {
-            Transmission::OpenDoc { doc } => ClientNotification::OpenDoc(DidOpenTextDocumentParams { text_document: doc }).into(),
-            Transmission::CloseDoc { doc } => ClientNotification::CloseDoc(DidCloseTextDocumentParams { text_document: doc}).into(),
-            Transmission::GetDocumentSymbol { doc } => ClientRequest::DocumentSymbol(DocumentSymbolParams { text_document: doc, work_done_progress_params: WorkDoneProgressParams::default(), partial_result_params: PartialResultParams::default() }).into(),
-            Transmission::Shutdown => ClientMessage::Shutdown,
+            Transmission::OpenDoc { doc } => {
+                Self::OpenDoc(DidOpenTextDocumentParams { text_document: doc })
+            }
+            Transmission::CloseDoc { doc } => {
+                Self::CloseDoc(DidCloseTextDocumentParams { text_document: doc })
+            }
+            Transmission::GetDocumentSymbol { doc } => {
+                Self::DocumentSymbol(DocumentSymbolParams {
+                    text_document: doc,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+            }
+            Transmission::Shutdown => Self::Shutdown,
         }
     }
 }
@@ -205,6 +240,7 @@ impl From<Transmission> for ClientMessage {
 #[derive(Debug, parse_display::Display)]
 #[display(style = "CamelCase")]
 pub enum Reception {
+    /// The symbols in a document.
     #[display("{0:?}")]
     // TODO: Should include the document that symbols come from.
     DocumentSymbols(DocumentSymbolResponse),
