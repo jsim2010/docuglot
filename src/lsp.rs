@@ -290,7 +290,6 @@ impl Tool {
     /// Transmits `messages` to the LSP server.
     #[throws(TranslationError)]
     pub(crate) fn transmit(&mut self, mut messages: Vec<ClientMessage>) {
-        log::trace!("transmit {:?}", messages);
         match &mut self.state {
             State::Uninitialized { ref root_dir } => {
                 self.lsp_server.input().produce(Message::from(Object::from(
@@ -333,7 +332,6 @@ impl Tool {
                 throw!(TranslationError::InvalidState(self.state.clone()));
             }
         }
-        log::trace!("end transmit");
     }
 
     /// Processes all receptions from LSP server.
@@ -408,15 +406,15 @@ impl Request<State, Event> for InitializeParams {
                     State::WaitingInitialization { messages } => {
                         match serde_json::from_value::<InitializeResult>(value) {
                             Ok(initialize_result) => {
-                                let mut m = messages.clone();
-                                m.push(ClientMessage::Initialized);
+                                let mut new_messages = vec![ClientMessage::Initialized];
+                                new_messages.append(messages);
 
                                 *state = State::Running {
                                     server_state: Box::new(initialize_result),
                                     registrations: Vec::new(),
                                 };
 
-                                Ok(Event::SendMessages(m))
+                                Ok(Event::SendMessages(new_messages))
                             }
                             Err(error) => Err(error),
                         }
