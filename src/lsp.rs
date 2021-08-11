@@ -1,30 +1,31 @@
 //! Implements the language server protocol functionality of docuglot.
-// TODO: This should be moved to only occur on cur (functionality exists in master but not 1.46.0.
-#![allow(clippy::wildcard_imports)] // cur is designed to use wildcard import.
+#![allow(clippy::wildcard_imports)] // Need to mark cur so that wildcard import is okay
 use {
     crate::json_rpc::{
-        self, InsertRequestError, Kind, MethodHandlers, Object, Outcome, Params,
-        ProcessResponseError, Request, ResponseHandlers,
+        Client, InsertRequestError, Kind, MethodHandlers, Object, Outcome, Params,
+        ProcessResponseError, Request, RequestObject, ResponseHandlers, ResponseObject, Server,
     },
-    conventus::AssembleFrom,
     core::{
-        fmt::{self, Display},
+        fmt::{self, Display, Formatter},
         str::Utf8Error,
+        task::Poll,
     },
     fehler::{throw, throws},
     lsp_types::{
-        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolClientCapabilities,
-        DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializeResult,
-        InitializedParams, RegistrationParams, TextDocumentSyncClientCapabilities, Url,
+        ClientCapabilities, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+        DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse,
+        InitializeParams, InitializeResult, InitializedParams, RegistrationParams,
+        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Url,
     },
-    market::{
-        channel::{WithdrawnDemandFault, WithdrawnSupplyFault},
-        io::{ReadFault, WriteFault},
-        process::Process,
-        ConsumeFault, Consumer, Failure, ProduceFailure, Producer,
+    market::{Consumer, Flawless, Flaws, Producer, ProductionFlaws, Recall},
+    market_types::{
+        compose::Composite,
+        io::{WriteDefect, Writer},
+        process::{NoWaitChildStdin, Product, ProductConsumer},
     },
+    serde::{Deserialize, Serialize},
     serde_json::Value,
-    std::process::{self, Command},
+    std::process::{self, Command, ExitStatus},
 };
 
 use cur::*;
@@ -49,9 +50,9 @@ fn initialize_params(root_dir: &Url) -> InitializeParams {
         root_path: None,
         root_uri: Some(root_dir.clone()),
         initialization_options: None,
-        capabilities: lsp_types::ClientCapabilities {
+        capabilities: ClientCapabilities {
             workspace: None,
-            text_document: Some(lsp_types::TextDocumentClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
                 synchronization: Some(TextDocumentSyncClientCapabilities {
                     dynamic_registration: None,
                     will_save: None,
@@ -100,140 +101,179 @@ fn initialize_params(root_dir: &Url) -> InitializeParams {
     }
 }
 
+/// A message to the language server.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Directive {
+    /// The client received the initialization.
+    Initialized,
+    /// The client is shutting down.
+    Shutdown,
+    /// The client is exiting.
+    Exit,
+    /// The client requests a document symbol.
+    DocumentSymbol(DocumentSymbolParams),
+    /// The client opened a document.
+    OpenDoc(DidOpenTextDocumentParams),
+    /// The client closed a document.
+    CloseDoc(DidCloseTextDocumentParams),
+}
+
+impl Display for Directive {
+    #[allow(clippy::use_debug)] // Params do not impl Display.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Initialized => write!(f, "Initialized"),
+            Self::Shutdown => write!(f, "Shutdown"),
+            Self::Exit => write!(f, "Exit"),
+            Self::DocumentSymbol(ref params) => write!(f, "DocumentSymbol {0:?}", params),
+            Self::OpenDoc(ref params) => write!(f, "OpenDoc {0:?}", params),
+            Self::CloseDoc(ref params) => write!(f, "CloseDoc {0:?}", params),
+        }
+    }
+}
+
+/// An error when the [`Tool`] is in an invalid state.
+#[derive(Debug, thiserror::Error)]
+#[error("Tool is in invalid state: {state}")]
+pub struct InvalidStateError {
+    /// The [`State`] of the [`Tool`].
+    state: State,
+}
+
 /// Describes events that the client must process.
 #[derive(Debug, parse_display::Display)]
 pub(crate) enum Event {
     /// The tool wants to send a message to the server.
     #[display("send message")]
-    SendMessages(Vec<ClientMessage>),
+    SendDirectives(Vec<Directive>),
     /// The tool encountered an error.
     #[display("error")]
-    Error(TranslationError),
+    Error(InvalidStateError),
     /// The tool received a document symbol.
     #[display("")]
     DocumentSymbol(DocumentSymbolResponse),
+    /// The tool has exited.
+    #[display("")]
+    Exit(ExitStatus),
 }
 
-/// An error during translation.
-#[derive(Debug, ConsumeFault, thiserror::Error)]
-pub enum TranslationError {
-    /// Failure while transmitting a client message.
-    #[error(transparent)]
-    Transmission(#[from] WriteFault<Message>),
-    /// Failure while receiving a server message.
-    #[error(transparent)]
-    Reception(#[from] ConsumeServerMessageError),
-    /// Failure while creating client.
-    #[error(transparent)]
-    CreateClient(#[from] CreateClientError),
-    /// Failure while waiting for process.
-    #[error(transparent)]
-    Wait(#[from] market::process::WaitFault),
-    /// Attempted to consume on channel with no supply.
-    #[error(transparent)]
-    NoSupply(#[from] WithdrawnSupplyFault),
-    /// Attempted to produce on channel with dropped [`Consumer`].
-    #[error(transparent)]
-    NoDemand(#[from] ProduceFailure<WithdrawnDemandFault>),
-    /// An error serializing a message.
+impl From<ExitStatus> for Event {
+    fn from(status: ExitStatus) -> Self {
+        Self::Exit(status)
+    }
+}
+
+/// An error when producing a transmission.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    /// An error serializing the message to be transmitted.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
-    /// An error reading the message.
+    /// An error producing the message.
     #[error(transparent)]
-    Read(#[from] ReadFault<Message>),
+    Recall(#[from] Recall<ProductionFlaws<WriteDefect>, u8>),
+}
+
+/// An error during transmission to the language server.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TransmissionError {
+    /// An error during transmission.
+    #[error(transparent)]
+    Tx(#[from] WriteError),
+    /// The tool is in an invalid state.
+    #[error(transparent)]
+    InvalidState(#[from] InvalidStateError),
+}
+
+impl From<serde_json::Error> for TransmissionError {
+    fn from(ser_error: serde_json::Error) -> Self {
+        Self::Tx(ser_error.into())
+    }
+}
+
+impl From<Recall<ProductionFlaws<WriteDefect>, u8>> for TransmissionError {
+    fn from(recall: Recall<ProductionFlaws<WriteDefect>, u8>) -> Self {
+        Self::Tx(recall.into())
+    }
+}
+
+/// An error during the reception of a message from the language server.
+#[derive(Debug, thiserror::Error)]
+pub enum ReceptionError {
+    /// An error while producing a response.
+    #[error(transparent)]
+    Response(#[from] WriteError),
     /// A JSON-RPC error.
     #[error(transparent)]
     ProcessResponse(#[from] ProcessResponseError),
-    /// An invalid state.
-    #[error("LSP client in invalid state: {0}")]
-    InvalidState(State),
 }
 
-/// A message to the language server.
-#[derive(Clone, Debug, parse_display::Display, PartialEq)]
-pub enum ClientMessage {
-    /// The client received the initialization.
-    #[display("Initialized")]
-    Initialized,
-    /// The client is shutting down.
-    #[display("Shutdown")]
-    Shutdown,
-    /// The client is exiting.
-    #[display("Exit")]
-    Exit,
-    /// The client requests a document symbol.
-    #[display("DocumentSymbol {0:?}")]
-    DocumentSymbol(DocumentSymbolParams),
-    /// The client opened a document.
-    #[display("OpenDoc w/ {0:?}")]
-    OpenDoc(DidOpenTextDocumentParams),
-    /// The client closed a document.
-    #[display("CloseDoc w/ {0:?}")]
-    CloseDoc(DidCloseTextDocumentParams),
-}
+/// An error while composing an error message.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("Error while composing error message")]
+pub(crate) struct ErrorMessageCompositionError;
 
 /// An error message.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ErrorMessage {
     /// The message.
     line: String,
 }
 
-/// An error while composing an error message.
-#[derive(Clone, Copy, ConsumeFault, Debug, thiserror::Error)]
-#[error("Error while composing error message")]
-pub(crate) struct ErrorMessageCompositionError;
+impl Composite<u8> for ErrorMessage {
+    type Misstep = ErrorMessageCompositionError;
 
-impl AssembleFrom<u8> for ErrorMessage {
-    type Error = ErrorMessageCompositionError;
-
-    #[inline]
-    #[throws(conventus::AssembleFailure<Self::Error>)]
-    fn assemble_from(parts: &mut Vec<u8>) -> Self {
-        if let Ok(s) = std::str::from_utf8_mut(parts) {
+    #[throws(Self::Misstep)]
+    fn compose(elements: &mut Vec<u8>) -> Poll<Self> {
+        if let Ok(s) = std::str::from_utf8_mut(elements) {
+            #[allow(clippy::option_if_let_else)]
+            // False trigger. See https://github.com/rust-lang/rust-clippy/issues/5822.
             if let Some(index) = s.find('\n') {
                 let (l, remainder) = s.split_at_mut(index);
-                let (_, new_parts) = remainder.split_at_mut(1);
+                let (_, new_elements) = remainder.split_at_mut(1);
                 let line = (*l).to_string();
-                *parts = new_parts.as_bytes().to_vec();
+                *elements = new_elements.as_bytes().to_vec();
 
-                Self { line }
+                Poll::Ready(Self { line })
             } else {
-                // parts does not contain a new line.
-                throw!(conventus::AssembleFailure::Incomplete);
+                // elements does not contain a new line.
+                Poll::Pending
             }
         } else {
-            // parts has some invalid uft8.
-            *parts = Vec::new();
+            // elements has some invalid uft8.
+            *elements = Vec::new();
             throw!(ErrorMessageCompositionError);
         }
     }
 }
 
 impl Display for ErrorMessage {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.line)
     }
 }
 
+impl From<ErrorMessage> for Product<Message, ErrorMessage> {
+    fn from(error_message: ErrorMessage) -> Self {
+        Self::Error(error_message)
+    }
+}
+
 /// Describes the state of the client.
-#[derive(Clone, Debug, parse_display::Display, PartialEq)]
-pub enum State {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum State {
     /// Server has not been initialized.
-    #[display("uninitialized")]
     Uninitialized {
         /// The desired root directory of the server.
         root_dir: Url,
     },
     /// Waiting for the server to confirm initialization.
-    #[display("waiting initialization")]
     WaitingInitialization {
-        /// Messages to be sent after initialization is confirmed.
-        messages: Vec<ClientMessage>,
+        /// [`Directive`]s to be sent after initialization is confirmed.
+        directives: Vec<Directive>,
     },
     /// Normal running state.
-    #[display("running")]
     Running {
         /// The state of the server.
         server_state: Box<InitializeResult>,
@@ -241,142 +281,166 @@ pub enum State {
         registrations: Vec<lsp_types::Registration>,
     },
     /// Waiting for the server to confirm shutdown.
-    #[display("waiting shutdown")]
     WaitingShutdown,
     /// Waiting for the server to exit.
-    #[display("waiting exit")]
     WaitingExit,
+}
+
+impl Display for State {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Uninitialized { .. } => write!(f, "uninitialized"),
+            Self::WaitingInitialization { .. } => write!(f, "waiting initialization"),
+            Self::Running { .. } => write!(f, "running"),
+            Self::WaitingShutdown => write!(f, "waiting shutdown"),
+            Self::WaitingExit => write!(f, "waiting exit"),
+        }
+    }
 }
 
 /// The LSP client.
 pub(crate) struct Tool {
-    /// The LSP server process.
-    lsp_server: Process<Message, Message, ErrorMessage>,
+    /// The writer
+    lsp_writer: Writer<NoWaitChildStdin>,
+    /// Consumes [`Product`] from the language server.
+    lsp_consumer: ProductConsumer<Message, ErrorMessage>,
     /// The JSON-RPC client.
-    rpc_client: json_rpc::Client<State, Event>,
+    rpc_client: Client<State, Event>,
     /// The JSON-RPC server.
-    rpc_server: json_rpc::Server<State>,
+    rpc_server: Server<State>,
     /// Defines the current state of `Self`.
     state: State,
 }
 
 impl Tool {
     /// Creates a new `Tool`.
-    #[throws(CreateClientError)]
+    #[throws(CreateToolError)]
     pub(crate) fn new(command: Command, root_dir: Url) -> Self {
+        let (lsp_writer, lsp_consumer) =
+            market_types::process::spawn::<Message, ErrorMessage, _>(command, "Tool process")?;
+
         Self {
-            lsp_server: market::process::Process::new(command)?,
+            lsp_writer,
+            lsp_consumer,
             state: State::Uninitialized { root_dir },
-            rpc_client: json_rpc::Client::new(),
-            rpc_server: json_rpc::Server::new(vec![RegistrationParams {
+            rpc_client: Client::new(),
+            rpc_server: Server::new(vec![RegistrationParams {
                 registrations: vec![],
             }])?,
         }
     }
 
     /// Creates a new [`Tool`] that is already waiting to exit.
-    #[throws(CreateClientError)]
+    #[throws(CreateToolError)]
     pub(crate) fn new_finished(command: Command) -> Self {
+        let (lsp_writer, lsp_consumer) = market_types::process::spawn(command, "Finished tool")?;
+
         Self {
-            lsp_server: market::process::Process::new(command)?,
+            lsp_writer,
+            lsp_consumer,
             state: State::WaitingExit,
-            rpc_client: json_rpc::Client::new(),
-            rpc_server: json_rpc::Server::new(vec![RegistrationParams {
+            rpc_client: Client::new(),
+            rpc_server: Server::new(vec![RegistrationParams {
                 registrations: vec![],
             }])?,
         }
     }
 
-    /// Transmits `messages` to the LSP server.
-    #[throws(TranslationError)]
-    pub(crate) fn transmit(&mut self, mut messages: Vec<ClientMessage>) {
-        match &mut self.state {
+    /// Writes `msg` to the language server.
+    #[throws(WriteError)]
+    fn write<M: Into<Message>>(&self, msg: M) {
+        self.lsp_writer
+            .produce_all(&mut msg.into().into_bytes()?.into_iter())?;
+    }
+
+    /// Transmits `directives` to the LSP server.
+    #[throws(TransmissionError)]
+    pub(crate) fn transmit(&mut self, mut directives: Vec<Directive>) {
+        let mut request_objects = Vec::new();
+
+        match self.state {
             State::Uninitialized { ref root_dir } => {
-                self.lsp_server.input().produce(Message::from(Object::from(
-                    self.rpc_client.request(&initialize_params(root_dir))?,
-                )))?;
-                self.state = State::WaitingInitialization { messages };
+                request_objects.push(self.rpc_client.request(&initialize_params(root_dir))?);
+                self.state = State::WaitingInitialization { directives };
             }
             State::WaitingInitialization {
-                messages: pending_messages,
+                directives: ref mut pending_transmissions,
             } => {
-                pending_messages.append(&mut messages);
+                pending_transmissions.append(&mut directives);
             }
             State::Running { .. } => {
-                for message in messages {
-                    self.lsp_server
-                        .input()
-                        .produce(Message::from(match message {
-                            ClientMessage::Initialized => {
-                                Object::from(self.rpc_client.request(&InitializedParams {})?)
-                            }
-                            ClientMessage::Shutdown => {
-                                Object::from(self.rpc_client.request(&ShutdownParams)?)
-                            }
-                            ClientMessage::Exit => {
-                                Object::from(self.rpc_client.request(&ExitParams {})?)
-                            }
-                            ClientMessage::DocumentSymbol(params) => {
-                                Object::from(self.rpc_client.request(&params)?)
-                            }
-                            ClientMessage::OpenDoc(params) => {
-                                Object::from(self.rpc_client.request(&params)?)
-                            }
-                            ClientMessage::CloseDoc(params) => {
-                                Object::from(self.rpc_client.request(&params)?)
-                            }
-                        }))?;
+                for directive in directives {
+                    request_objects.push(match directive {
+                        Directive::Initialized => self.rpc_client.request(&InitializedParams {})?,
+                        Directive::Shutdown => {
+                            self.state = State::WaitingShutdown;
+                            self.rpc_client.request(&ShutdownParams)?
+                        }
+                        Directive::Exit => self.rpc_client.request(&ExitParams {})?,
+                        Directive::DocumentSymbol(params) => self.rpc_client.request(&params)?,
+                        Directive::OpenDoc(params) => self.rpc_client.request(&params)?,
+                        Directive::CloseDoc(params) => self.rpc_client.request(&params)?,
+                    });
                 }
             }
             State::WaitingShutdown | State::WaitingExit => {
-                throw!(TranslationError::InvalidState(self.state.clone()));
+                throw!(InvalidStateError {
+                    state: self.state.clone()
+                });
             }
+        }
+
+        for request_object in request_objects {
+            self.write(request_object)?;
         }
     }
 
     /// Processes all receptions from LSP server.
-    #[throws(TranslationError)]
+    #[throws(ReceptionError)]
     pub(crate) fn process_receptions(&mut self) -> Vec<Event> {
         let mut receptions = Vec::new();
 
-        for good in self.lsp_server.output().goods() {
-            if let Some(reception) = match good?.into() {
-                Kind::Request(request_object) => {
-                    if let Some(response) = self
-                        .rpc_server
-                        .process_request(&mut self.state, request_object)
-                    {
-                        self.lsp_server
-                            .input()
-                            .produce(Message::from(Object::from(response)))?;
-                    }
+        match self.lsp_consumer.consume() {
+            Ok(product) => match product {
+                Product::Output(message) => {
+                    let reception = match message.into() {
+                        Kind::Request(request_object) => {
+                            if let Some(response) = self
+                                .rpc_server
+                                .process_request(&mut self.state, request_object)
+                            {
+                                self.write(response)?;
+                            }
 
-                    None
+                            None
+                        }
+                        Kind::Response(response) => self
+                            .rpc_client
+                            .process_response(&mut self.state, response)?,
+                    };
+
+                    if let Some(r) = reception {
+                        receptions.push(r);
+                    }
                 }
-                Kind::Response(response) => self
-                    .rpc_client
-                    .process_response(&mut self.state, response)?,
-            } {
-                receptions.push(reception);
+                Product::Error(error_message) => {
+                    log::error!("lsp stderr: {}", error_message);
+                }
+                Product::Exit(status) => {
+                    receptions.push(status.into());
+                }
+                _ => {
+                    log::error!("lsp received unknown product: {:?}", product);
+                }
+            },
+            Err(failure) => {
+                if failure.is_defect() {
+                    log::error!("process receptions: {}", failure);
+                }
             }
         }
 
         receptions
-    }
-
-    /// Logs all messages that have currently been received on stderr.
-    pub(crate) fn log_errors(&self) {
-        for good in self.lsp_server.error().goods() {
-            match good {
-                Ok(message) => log::error!("lsp stderr: {}", message),
-                Err(error) => log::error!("error logger: {}", error),
-            }
-        }
-    }
-
-    /// Returns the server process.
-    pub(crate) const fn server(&self) -> &Process<Message, Message, ErrorMessage> {
-        &self.lsp_server
     }
 
     /// If state of `self` is waiting exit.
@@ -395,26 +459,26 @@ impl Request<State, Event> for InitializeParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |mut state, value| {
-                Some(match &mut state {
+            |state, value| {
+                Some(match *state {
                     State::Uninitialized { .. }
                     | State::Running { .. }
                     | State::WaitingShutdown
-                    | State::WaitingExit => {
-                        Ok(Event::Error(TranslationError::InvalidState(state.clone())))
-                    }
-                    State::WaitingInitialization { messages } => {
+                    | State::WaitingExit => Ok(Event::Error(InvalidStateError {
+                        state: state.clone(),
+                    })),
+                    State::WaitingInitialization { ref mut directives } => {
                         match serde_json::from_value::<InitializeResult>(value) {
                             Ok(initialize_result) => {
-                                let mut new_messages = vec![ClientMessage::Initialized];
-                                new_messages.append(messages);
+                                let mut new_directives = vec![Directive::Initialized];
+                                new_directives.append(directives);
 
                                 *state = State::Running {
                                     server_state: Box::new(initialize_result),
                                     registrations: Vec::new(),
                                 };
 
-                                Ok(Event::SendMessages(new_messages))
+                                Ok(Event::SendDirectives(new_directives))
                             }
                             Err(error) => Err(error),
                         }
@@ -455,17 +519,17 @@ impl Request<State, Event> for ShutdownParams {
 
     fn response_handlers(&self) -> Option<ResponseHandlers<State, Event>> {
         Some((
-            |mut state, _| {
-                Some(match &mut state {
+            |state, _| {
+                Some(match *state {
                     State::Uninitialized { .. }
                     | State::Running { .. }
                     | State::WaitingInitialization { .. }
-                    | State::WaitingExit => {
-                        Ok(Event::Error(TranslationError::InvalidState(state.clone())))
-                    }
+                    | State::WaitingExit => Ok(Event::Error(InvalidStateError {
+                        state: state.clone(),
+                    })),
                     State::WaitingShutdown => {
                         *state = State::WaitingExit;
-                        Ok(Event::SendMessages(vec![ClientMessage::Exit]))
+                        Ok(Event::SendDirectives(vec![Directive::Exit]))
                     }
                 })
             },
@@ -527,16 +591,17 @@ impl Request<State, Event> for RegistrationParams {
 
     fn method_handlers(&self) -> MethodHandlers<State> {
         (
-            Some(|mut state, params| match &mut state {
-                State::Running { registrations, .. } => {
-                    match serde_json::from_value::<Self>(params.into()) {
-                        Ok(mut register) => {
-                            registrations.append(&mut register.registrations);
-                            Outcome::Result(Value::Null)
-                        }
-                        Err(error) => Outcome::invalid_params(&error),
+            Some(|state, params| match *state {
+                State::Running {
+                    ref mut registrations,
+                    ..
+                } => match serde_json::from_value::<Self>(params.into()) {
+                    Ok(mut register) => {
+                        registrations.append(&mut register.registrations);
+                        Outcome::Result(Value::Null)
                     }
-                }
+                    Err(error) => Outcome::invalid_params(&error),
+                },
                 State::Uninitialized { .. }
                 | State::WaitingInitialization { .. }
                 | State::WaitingExit
@@ -549,7 +614,7 @@ impl Request<State, Event> for RegistrationParams {
 
 /// Represents an LSP message.
 // Do not use parse_display::Display as this requires Object be public.
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Message {
     /// The JSON-RPC object of the message.
     content: Object,
@@ -557,85 +622,121 @@ pub struct Message {
 
 impl Message {
     /// Returns the header contained in `string`.
+    #[throws(ComposeMessageMisstep)]
     fn header(string: &str) -> Option<&str> {
-        string
-            .find(HEADER_END)
-            .and_then(|header_length| string.get(..header_length))
+        if let Some(header_length) = string.find(HEADER_END) {
+            Some(
+                string
+                    .get(..header_length)
+                    .ok_or(ComposeMessageMisstep::InvalidHeaderEnd)?,
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Converts `self` into a [`Vec<u8>`].
+    #[throws(serde_json::Error)]
+    fn into_bytes(self) -> Vec<u8> {
+        let content = serde_json::to_string(&self.content)?;
+
+        format!(
+            "{}{}{}{}{}",
+            HEADER_CONTENT_LENGTH,
+            HEADER_FIELD_NAME_DELIMITER,
+            content.len(),
+            HEADER_END,
+            content
+        )
+        .as_bytes()
+        .to_vec()
     }
 }
 
-impl AssembleFrom<u8> for Message {
-    type Error = AssembleMessageError;
+impl Composite<u8> for Message {
+    type Misstep = ComposeMessageMisstep;
 
-    #[inline]
-    #[throws(conventus::AssembleFailure<AssembleMessageError>)]
-    fn assemble_from(parts: &mut Vec<u8>) -> Self {
-        // TODO: This would probably be simpler with a regex.
+    #[throws(Self::Misstep)]
+    fn compose(elements: &mut Vec<u8>) -> Poll<Self> {
         let mut length = 0;
 
-        let string = std::str::from_utf8(parts).map_err(Self::Error::from)?;
-        let header = Self::header(string).ok_or(conventus::AssembleFailure::Incomplete)?;
-        // saturating_add will not reach end due to full header_len needing to exist in string.
-        let header_len = header.len().saturating_add(HEADER_END.len());
-        let mut content_length: Option<usize> = None;
+        let string = std::str::from_utf8(elements).map_err(Self::Misstep::from)?;
+        if let Some(header) = Self::header(string)? {
+            // saturating_add will not reach end due to full header_len needing to exist in string.
+            let header_len = header.len().saturating_add(HEADER_END.len());
+            let mut content_length: Option<usize> = None;
 
-        for field in header.split(HEADER_FIELD_DELIMITER) {
-            let mut items = field.split(": ");
+            for field in header.split(HEADER_FIELD_DELIMITER) {
+                let mut items = field.split(": ");
 
-            if items.next() == Some(HEADER_CONTENT_LENGTH) {
-                if let Some(content_length_str) = items.next() {
-                    if let Ok(value) = content_length_str.parse() {
-                        content_length = Some(value);
+                if items.next() == Some(HEADER_CONTENT_LENGTH) {
+                    if let Some(content_length_str) = items.next() {
+                        if let Ok(value) = content_length_str.parse() {
+                            content_length = Some(value);
+                        }
                     }
+
+                    break;
                 }
-
-                break;
             }
-        }
 
-        // Cannot return from function until after parts.drain() is called.
-        let object: Result<Object, _> = match content_length {
-            None => {
-                length = header_len;
-                Err(conventus::AssembleFailure::Error(
-                    AssembleMessageError::MissingContentLength,
-                ))
-            }
-            Some(content_length) => {
-                #[allow(clippy::option_if_let_else)]
-                // False trigger. See https://github.com/rust-lang/rust-clippy/issues/5822.
-                if let Some(total_len) = header_len.checked_add(content_length) {
-                    if parts.len() < total_len {
-                        Err(conventus::AssembleFailure::Incomplete)
-                    } else if let Some(content) = string.get(header_len..total_len) {
-                        length = total_len;
-                        serde_json::from_str(content).map_err(|error| {
-                            conventus::AssembleFailure::Error(AssembleMessageError::from(error))
-                        })
+            // Cannot return from function until after elements.drain() is called.
+            let object: Result<Poll<Object>, _> = match content_length {
+                None => {
+                    length = header_len;
+                    Err(ComposeMessageMisstep::MissingContentLength)
+                }
+                Some(content_length) => {
+                    #[allow(clippy::option_if_let_else)]
+                    // False trigger. See https://github.com/rust-lang/rust-clippy/issues/5822.
+                    if let Some(total_len) = header_len.checked_add(content_length) {
+                        if elements.len() < total_len {
+                            Ok(Poll::Pending)
+                        } else if let Some(content) = string.get(header_len..total_len) {
+                            length = total_len;
+                            serde_json::from_str(content)
+                                .map_err(ComposeMessageMisstep::from)
+                                .map(Poll::Ready)
+                        } else {
+                            length = header_len;
+                            Err(ComposeMessageMisstep::InvalidContentLength)
+                        }
                     } else {
                         length = header_len;
-                        Err(conventus::AssembleFailure::Error(
-                            AssembleMessageError::InvalidContentLength,
-                        ))
+                        Err(ComposeMessageMisstep::InvalidContentLength)
                     }
-                } else {
-                    length = header_len;
-                    Err(conventus::AssembleFailure::Error(
-                        AssembleMessageError::InvalidContentLength,
-                    ))
                 }
-            }
-        };
+            };
 
-        let _ = parts.drain(..length);
-        object?.into()
+            drop(elements.drain(..length));
+            object?.map(Self::from)
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 impl Display for Message {
-    #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.content)
+    }
+}
+
+impl From<Object> for Message {
+    fn from(value: Object) -> Self {
+        Self { content: value }
+    }
+}
+
+impl From<RequestObject> for Message {
+    fn from(request_obj: RequestObject) -> Self {
+        Self::from(Object::from(request_obj))
+    }
+}
+
+impl From<ResponseObject> for Message {
+    fn from(response_obj: ResponseObject) -> Self {
+        Self::from(Object::from(response_obj))
     }
 }
 
@@ -645,10 +746,9 @@ impl From<Message> for Kind {
     }
 }
 
-impl From<Object> for Message {
-    #[inline]
-    fn from(value: Object) -> Self {
-        Self { content: value }
+impl From<Message> for Product<Message, ErrorMessage> {
+    fn from(message: Message) -> Self {
+        Self::Output(message)
     }
 }
 
@@ -661,15 +761,14 @@ pub enum DisassembleMessageFault {
     Serialize(#[from] serde_json::Error),
 }
 
-impl Failure for DisassembleMessageFault {
-    type Fault = Self;
+impl Flaws for DisassembleMessageFault {
+    type Insufficiency = Flawless;
+    type Defect = Self;
 }
 
-#[allow(clippy::use_self)] // False positive on format!.
 impl conventus::DisassembleFrom<Message> for u8 {
     type Error = DisassembleMessageFault;
 
-    #[inline]
     #[throws(Self::Error)]
     fn disassemble_from(good: Message) -> Vec<Self> {
         let content = serde_json::to_string(&good.content)?;
@@ -688,8 +787,11 @@ impl conventus::DisassembleFrom<Message> for u8 {
 }
 
 /// Error while assembling a `Message`.
-#[derive(ConsumeFault, Debug, thiserror::Error)]
-pub enum AssembleMessageError {
+#[derive(Debug, thiserror::Error)]
+pub enum ComposeMessageMisstep {
+    /// Unable to find end of header.
+    #[error("")]
+    InvalidHeaderEnd,
     /// Received bytes were not valid utf8.
     #[error(transparent)]
     Utf8(#[from] Utf8Error),
@@ -706,19 +808,11 @@ pub enum AssembleMessageError {
 
 /// Failed to create `Client`.
 #[derive(Debug, thiserror::Error)]
-pub enum CreateClientError {
+pub enum CreateToolError {
     /// Failed to create server process.
     #[error(transparent)]
-    CreateProcess(#[from] market::process::CreateProcessError),
+    CreateProcess(#[from] std::io::Error),
     /// Failed to insert request.
     #[error(transparent)]
     InsertRequest(#[from] InsertRequestError),
-}
-
-/// Client failed to consume `lsp::ServerMessage`.
-#[derive(ConsumeFault, Debug, thiserror::Error)]
-pub enum ConsumeServerMessageError {
-    /// Client failed to consume lsp::Message from server.
-    #[error(transparent)]
-    Consume(#[from] ReadFault<Message>),
 }

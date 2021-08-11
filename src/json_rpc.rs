@@ -1,17 +1,17 @@
 //! Defines JSON-RPC structures and processing.
+#![allow(clippy::use_self)] // False positives on Params and Id; see https://github.com/rust-lang/rust-clippy/issues/6902.
 use {
     core::fmt::{self, Debug, Display, Formatter},
     fehler::{throw, throws},
     serde::{Deserialize, Serialize},
     serde_json::{Map, Number, Value},
     std::{
-        collections::hash_map::{Entry, HashMap},
+        collections::hash_map::HashMap,
         sync::atomic::{AtomicU64, Ordering},
     },
 };
 
 /// The minimum value of a predefined error code.
-#[allow(clippy::decimal_literal_representation)] // Decimal version is used in specification.
 const PREDEFINED_ERROR_MIN_CODE: i64 = -32768;
 /// A code value indicating a parse error.
 const PARSE_ERROR_CODE: i64 = -32700;
@@ -168,26 +168,36 @@ impl Display for RequestObject {
         write!(
             f,
             "{}",
-            match &self.id {
-                Some(id) => format!("Request[{}]: '{}' w/ {}", id, self.method, self.params),
-                None => format!("Notification: '{}' w/ {}", self.method, self.params),
+            if let Some(ref id) = self.id {
+                format!("Request[{}]: `{}` w/ {}", id, self.method, self.params)
+            } else {
+                format!("Notification: `{}` w/ {}", self.method, self.params)
             }
         )
     }
 }
 
 /// An Object or Array value that holds the parameters of a JSON-RPC method.
-#[derive(Clone, Debug, Deserialize, parse_display::Display, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Params {
     /// No parameters.
     None,
     /// An array of parameters.
-    #[display("{0:?}")]
     Array(Vec<Value>),
     /// A map of parameters.
-    #[display("{0:?}")]
     Object(Map<String, Value>),
+}
+
+impl Display for Params {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        #[allow(clippy::use_debug)] // Vec and Map do not impl Display.
+        match *self {
+            Params::None => write!(f, "None"),
+            Params::Array(ref params) => write!(f, "{:?}", params),
+            Params::Object(ref map) => write!(f, "{:?}", map),
+        }
+    }
 }
 
 impl From<Value> for Params {
@@ -204,7 +214,6 @@ impl From<Value> for Params {
 }
 
 impl From<Params> for Value {
-    #[inline]
     fn from(params: Params) -> Self {
         match params {
             Params::None => Self::Null,
@@ -217,19 +226,26 @@ impl From<Params> for Value {
 /// The identifier of a JSON-RPC Request.
 ///
 /// MUST contain a String, Number, or NULL value.
-#[derive(Clone, Debug, Deserialize, Eq, parse_display::Display, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
 pub(crate) enum Id {
     /// A null id.
-    #[display("NULL")]
     Null,
     /// A numeric id.
-    #[display("{0}")]
     Num(Number),
     /// A string id.
-    #[display("{0}")]
     Str(String),
+}
+
+impl Display for Id {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Null => write!(f, "NULL"),
+            Self::Num(ref number) => write!(f, "{0}", number),
+            Self::Str(ref string) => write!(f, "{0}", string),
+        }
+    }
 }
 
 impl From<u64> for Id {
@@ -266,7 +282,7 @@ impl Outcome {
     pub(crate) fn unknown_request() -> Self {
         Self::Error(ErrorObject {
             code: METHOD_NOT_FOUND_CODE,
-            message: METHOD_NOT_FOUND_MESSAGE.to_string(),
+            message: METHOD_NOT_FOUND_MESSAGE.to_owned(),
             data: None,
         })
     }
@@ -275,7 +291,7 @@ impl Outcome {
     pub(crate) fn invalid_state() -> Self {
         Self::Error(ErrorObject {
             code: -127,
-            message: "Invalid state".to_string(),
+            message: "Invalid state".to_owned(),
             data: None,
         })
     }
@@ -284,7 +300,7 @@ impl Outcome {
     pub(crate) fn invalid_params(error: &serde_json::Error) -> Self {
         Self::Error(ErrorObject {
             code: INVALID_PARAMS_CODE,
-            message: "Invalid method parameter(s)".to_string(),
+            message: "Invalid method parameter(s)".to_owned(),
             data: Some(Value::String(error.to_string())),
         })
     }
@@ -331,23 +347,19 @@ impl<S, O> Client<S, O> {
     #[throws(serde_json::Error)]
     pub(crate) fn request<R: Request<S, O>>(&mut self, request: &R) -> RequestObject {
         let request = RequestObject {
-            method: R::METHOD.to_string(),
+            method: R::METHOD.to_owned(),
             params: request.params()?,
             id: request.response_handlers().map(|handlers| {
-                // Increment self.next_id until we find an id that is not currently awaiting a response.
-                // Theoretically, it is possible this could turn into an infinite loop if all possible 2^64 ids were used. Pratically, this is unreasonable.
-                loop {
-                    let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-                    if let Entry::Vacant(entry) = self.response_handlers.entry(id_num) {
-                        #[allow(unused_results)] // Reference to inserted value is unneeded.
-                        {
-                            entry.insert(handlers);
-                        }
-
-                        break Id::Num(id_num.into());
-                    }
+                if self.response_handlers.insert(id_num, handlers).is_some() {
+                    log::warn!(
+                        "Overwrote response handler for id `{}` that was never used",
+                        id_num
+                    );
                 }
+
+                Id::Num(id_num.into())
             }),
         };
         log::trace!("{}", request);
@@ -433,7 +445,7 @@ fn insert_request<S, O, R: Request<S, O>>(
             .is_some()
         {
             throw!(InsertRequestError {
-                method: R::METHOD.to_string(),
+                method: R::METHOD.to_owned(),
                 was_request: true,
             });
         }
@@ -445,7 +457,7 @@ fn insert_request<S, O, R: Request<S, O>>(
             .is_some()
         {
             throw!(InsertRequestError {
-                method: R::METHOD.to_string(),
+                method: R::METHOD.to_owned(),
                 was_request: false,
             });
         }
@@ -494,7 +506,7 @@ impl<S> Server<S> {
                     Outcome::unknown_request()
                 };
 
-            Some(ResponseObject { id, outcome })
+            Some(ResponseObject { outcome, id })
         } else if let Some(notification_handler) =
             self.notification_handlers.get(request.method.as_str())
         {
@@ -511,7 +523,7 @@ impl<S> Server<S> {
 }
 
 /// An error returned from JSON-RPC.
-#[derive(Debug, thiserror::Error, market::ConsumeFault)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     /// An error predefined by the JSON-RPC specification.
     #[error(transparent)]
@@ -545,7 +557,7 @@ impl From<ErrorObject> for Error {
 }
 
 /// An error predefined by the JSON-RPC specification.
-#[derive(Debug, thiserror::Error, market::ConsumeFault)]
+#[derive(Debug, thiserror::Error)]
 pub enum PredefinedError {
     /// A parse error.
     #[error("An error occurred while parsing the JSON text")]
